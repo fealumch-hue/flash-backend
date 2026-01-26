@@ -8,11 +8,17 @@ dotenv.config();
 
 const router = express.Router();
 
-// Initialize Supabase client
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_KEY
-);
+// Initialize Supabase client only if credentials are provided
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
+    supabase = createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_KEY
+    );
+    console.log('✅ Supabase client initialized');
+} else {
+    console.log('⚠️ Supabase not configured - file upload via /upload will be disabled');
+}
 
 // Configure multer for file upload (10MB limit, memory storage)
 const upload = multer({
@@ -38,6 +44,14 @@ const upload = multer({
 // POST /upload endpoint
 router.post('/', upload.single('file'), async (req, res, next) => {
     try {
+        // Check if Supabase is configured
+        if (!supabase) {
+            return res.status(503).json({
+                error: 'File upload service not configured',
+                details: 'Supabase credentials not provided'
+            });
+        }
+
         // Check if file was uploaded
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
