@@ -168,3 +168,5 @@ Thumbs.db
 # Temporary files
 *.tmp
 .cache/
+backend/service-account-key.json
+backend/service-account-key.json
