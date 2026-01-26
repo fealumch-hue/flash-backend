@@ -15,8 +15,8 @@ import { submitScore, subscribeToLeaderboard, getUserRank, LeaderboardEntry } fr
 import FileUpload from './FileUpload';
 import mammoth from 'mammoth';
 
-// School Bot URL from environment variable
-const SCHOOL_BOT_URL = (import.meta as any).env?.VITE_SCHOOL_BOT_URL || 'http://localhost:8002';
+// School Bot URL from environment variable (ensure no trailing slash)
+const SCHOOL_BOT_URL = ((import.meta as any).env?.VITE_SCHOOL_BOT_URL || 'http://localhost:8002').replace(/\/$/, '');
 
 declare global {
   interface Window {
