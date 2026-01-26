@@ -1,0 +1,3960 @@
+
+// Standardized React import to resolve JSX namespace issues
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
+import { signOut } from "firebase/auth";
+import { auth } from '../firebaseConfig';
+import { Icons } from './Icons';
+import { Assignment, PulseMode, UserProfile, UserClass, Attachment, Tab } from '../types';
+import { getPulseResponse, extractAssignmentsFromImage, parseRawTextToAssignments, PulseResponse, parseGradesText } from '../services/geminiService';
+import { playUISound } from '../services/soundService';
+import { uploadWordDocument, formatFileSize } from '../services/wordUploadService';
+import { SubjectObjectivesDropdown } from './SubjectObjectivesDropdown';
+import { submitScore, subscribeToLeaderboard, getUserRank, LeaderboardEntry } from '../services/leaderboardService';
+import FileUpload from './FileUpload';
+import mammoth from 'mammoth';
+
+declare global {
+  interface Window {
+    katex: any;
+    google: any;
+    gapi: any;
+    pdfjsLib: any;
+  }
+}
+
+type ModalTab = 'manual' | 'ai';
+type Strategy = 'scholar' | 'cheat';
+type Intelligence = 'fast' | 'think';
+type CardSize = 'compact' | 'comfortable';
+type ViewMode = 'grid' | 'list';
+
+interface PulseMessage {
+  role: 'user' | 'model';
+  content: string;
+  mode?: PulseMode;
+  strategy?: Strategy;
+  intelligence?: Intelligence;
+  image?: string;
+  sources?: { title: string; uri: string }[];
+  file?: {
+    data: string;
+    mimeType: string;
+    name: string;
+  };
+}
+
+interface AppSettings {
+  theme: 'light' | 'dark' | 'system';
+  reduceMotion: boolean;
+  compactMode: boolean;
+  autoArchive: boolean;
+  confirmDelete: boolean;
+  soundEffects: boolean;
+  tourCompleted: boolean;
+  selectedClass?: UserClass;
+  defaultPulseStrategy: Strategy;
+  defaultPulseIntelligence: Intelligence;
+  autoOpenPulse: boolean;
+  suggestPulseDueToday: boolean;
+  confirmSubmission: boolean;
+  showChecklist: boolean;
+  lockAfterSubmission: boolean;
+  cardSize: CardSize;
+}
+
+const WEIGHTS: Record<string, number> = {
+  classwork: 0.2,
+  homework: 0.2,
+  quizzes: 0.3,
+  participation: 0.1,
+  finalExam: 0.2
+};
+
+const DEFAULT_COUNTS: Record<string, number> = {
+  classwork: 18,
+  homework: 9,
+  quizzes: 3,
+  participation: 9,
+  finalExam: 1
+};
+
+
+// --- Custom UI Components ---
+
+const CustomSelect: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  placeholder?: string;
+  className?: string;
+}> = ({ value, onChange, options, placeholder = "Select...", className = "" }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const selectedLabel = options.find(opt => opt.value === value)?.label || placeholder;
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  return (
+    <div className={`relative ${className}`} ref={containerRef}>
+      <button
+        type="button"
+        onClick={() => { setIsOpen(!isOpen); playUISound('switch'); }}
+        className="w-full flex items-center justify-between bg-gray-50 dark:bg-white/5 border border-transparent dark:border-white/10 p-5 rounded-2xl outline-none text-sm font-bold uppercase tracking-widest transition-all hover:border-blue-500/30"
+      >
+        <span className={value ? "text-gray-900 dark:text-white" : "text-gray-400"}>{selectedLabel}</span>
+        <Icons.ChevronRight className={`w-4 h-4 text-gray-400 transition-transform duration-300 ${isOpen ? 'rotate-90' : 'rotate-0'}`} />
+      </button>
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 10, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 10, scale: 0.95 }}
+            className="absolute z-[100] mt-2 w-full bg-white dark:bg-[#1a1a1a] border border-gray-100 dark:border-white/10 rounded-2xl shadow-2xl overflow-hidden py-2 max-h-60 overflow-y-auto"
+          >
+            {options.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => { onChange(opt.value); setIsOpen(false); playUISound('action'); }}
+                className={`w-full text-left px-6 py-4 text-xs font-bold uppercase tracking-widest transition-colors ${value === opt.value ? 'bg-blue-600 text-white' : 'hover:bg-gray-50 dark:hover:bg-white/5 text-gray-600 dark:text-gray-400'}`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+// --- Timetable Logic for 10A (Updated from PDF) ---
+const SCHEDULE_10A: Record<number, { start: string, end: string, subject: string }[]> = {
+  0: [ // Sunday
+    { start: "08:00", end: "08:45", subject: "GERMAN" },
+    { start: "08:45", end: "09:30", subject: "GERMAN" },
+    { start: "09:30", end: "10:15", subject: "ARABIC" },
+    { start: "10:15", end: "11:00", subject: "MATH" },
+    { start: "11:00", end: "11:40", subject: "Break" },
+    { start: "11:40", end: "12:20", subject: "BIOLOGY" },
+    { start: "12:20", end: "13:05", subject: "BIOLOGY" },
+    { start: "13:05", end: "13:50", subject: "SOCIAL STUDIES" },
+    { start: "13:50", end: "14:35", subject: "ENGLISH" },
+  ],
+  1: [ // Monday
+    { start: "08:00", end: "08:45", subject: "ARABIC" },
+    { start: "08:45", end: "09:30", subject: "ARABIC" },
+    { start: "09:30", end: "10:15", subject: "GERMAN" },
+    { start: "10:15", end: "11:00", subject: "GERMAN" },
+    { start: "11:00", end: "11:40", subject: "Break" },
+    { start: "11:40", end: "12:20", subject: "ENGLISH" },
+    { start: "12:20", end: "13:05", subject: "ENGLISH" },
+    { start: "13:05", end: "13:50", subject: "ART" },
+    { start: "13:50", end: "14:35", subject: "ART" },
+  ],
+  2: [ // Tuesday
+    { start: "08:00", end: "08:45", subject: "BIOLOGY" },
+    { start: "08:45", end: "09:30", subject: "BIOLOGY" },
+    { start: "09:30", end: "10:15", subject: "MATH" },
+    { start: "10:15", end: "11:00", subject: "MATH" },
+    { start: "11:00", end: "11:40", subject: "Break" },
+    { start: "11:40", end: "12:20", subject: "ARABIC HISTORY" },
+    { start: "12:20", end: "13:05", subject: "ENGLISH" },
+    { start: "13:05", end: "13:50", subject: "ENGLISH" },
+    { start: "13:50", end: "14:35", subject: "Activity" },
+  ],
+  3: [ // Wednesday
+    { start: "08:00", end: "08:45", subject: "MATH" },
+    { start: "08:45", end: "09:30", subject: "BIOLOGY" },
+    { start: "09:30", end: "10:15", subject: "RELIGION" },
+    { start: "10:15", end: "11:00", subject: "SOCIAL STUDIES" },
+    { start: "11:00", end: "11:40", subject: "Break" },
+    { start: "11:40", end: "12:20", subject: "SOCIAL STUDIES" },
+    { start: "12:20", end: "13:05", subject: "INFORMATION TECHNOLOGY" },
+    { start: "13:05", end: "13:50", subject: "INFORMATION TECHNOLOGY" },
+    { start: "13:50", end: "14:35", subject: "ARABIC HISTORY" },
+  ],
+  4: [ // Thursday
+    { start: "08:00", end: "08:45", subject: "SOCIAL STUDIES" },
+    { start: "08:45", end: "09:30", subject: "ARABIC" },
+    { start: "09:30", end: "10:15", subject: "ENGLISH" },
+    { start: "10:15", end: "11:00", subject: "ENGLISH" },
+    { start: "11:00", end: "11:40", subject: "Break" },
+    { start: "11:40", end: "12:20", subject: "MATH" },
+    { start: "12:20", end: "13:05", subject: "Debate" },
+    { start: "13:05", end: "13:50", subject: "PHYSICAL EDUCATION" },
+    { start: "13:50", end: "14:35", subject: "PHYSICAL EDUCATION" },
+  ]
+};
+
+const getCurrentAndNextSession = (userClass?: UserClass) => {
+  const now = new Date();
+  const day = now.getDay();
+  if (day === 5 || day === 6) return { current: "Weekend", next: "Sunday Morning", type: 'single' };
+  const currentTimeStr = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0');
+  const daySchedule = SCHEDULE_10A[day] || [];
+  let currentSession = "Out of Hours";
+  let nextSession = "Home";
+  let sessionType: 'block' | 'single' = 'single';
+
+  for (let i = 0; i < daySchedule.length; i++) {
+    const slot = daySchedule[i];
+    if (currentTimeStr >= slot.start && currentTimeStr < slot.end) {
+      currentSession = slot.subject;
+
+      const isPrevSame = i > 0 && daySchedule[i - 1].subject === currentSession && currentSession !== "Break";
+      const isNextSame = i < daySchedule.length - 1 && daySchedule[i + 1].subject === currentSession && currentSession !== "Break";
+      if (isPrevSame || isNextSame) sessionType = 'block';
+
+      let lookaheadIdx = i + 1;
+      while (lookaheadIdx < daySchedule.length && daySchedule[lookaheadIdx].subject === currentSession) {
+        lookaheadIdx++;
+      }
+
+      nextSession = daySchedule[lookaheadIdx] ? daySchedule[lookaheadIdx].subject : "End of Day";
+      break;
+    } else if (currentTimeStr < slot.start) {
+      currentSession = "Transition / Free";
+      nextSession = slot.subject;
+      break;
+    }
+  }
+  return { current: currentSession, next: nextSession, type: sessionType };
+};
+
+const normalizeSubject = (subject: string): string => {
+  if (!subject) return 'GENERAL';
+  let clean = subject.trim().replace(/^\d+/, '').replace(/\s+/g, ' ');
+  const s = clean.toLowerCase();
+  const map: Record<string, string> = {
+    'ss': 'SOCIAL STUDIES', 'social studies': 'SOCIAL STUDIES',
+    'bio': 'BIOLOGY', 'biology': 'BIOLOGY',
+    'math': 'MATH', 'mathematics': 'MATH',
+    'eng': 'ENGLISH', 'english': 'ENGLISH',
+    'ara': 'ARABIC', 'arabic': 'ARABIC', 'arabic studies': 'ARABIC',
+    'moe': 'ARABIC HISTORY', 'arabic history': 'ARABIC HISTORY',
+    'ger': 'GERMAN', 'german': 'GERMAN',
+    'rel': 'RELIGION', 'religion': 'RELIGION', 'islamic': 'ISLAMIC STUDIES', 'islamic studies': 'ISLAMIC STUDIES',
+    'pe': 'PHYSICAL EDUCATION', 'physical education': 'PHYSICAL EDUCATION',
+    'it': 'INFORMATION TECHNOLOGY', 'information technology': 'INFORMATION TECHNOLOGY', 'ict': 'INFORMATION TECHNOLOGY',
+    'cs': 'COMPUTER SCIENCE', 'comp sci': 'COMPUTER SCIENCE',
+    'science': 'BIOLOGY', 'phys': 'PHYSICS', 'chem': 'CHEMISTRY',
+    'art': 'ART', 'general': 'GENERAL'
+  };
+  if (map[s]) return map[s];
+  return clean.toUpperCase();
+};
+
+const getRelativeDueDate = (dueDate: string): string => {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const due = new Date(dueDate);
+  due.setHours(0, 0, 0, 0);
+  const diffTime = due.getTime() - now.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+  if (diffDays < 0) return `Overdue by ${Math.abs(diffDays)} day${Math.abs(diffDays) !== 1 ? 's' : ''}`;
+  if (diffDays === 0) return 'Due today';
+  if (diffDays === 1) return 'Due tomorrow';
+  return `Due in ${diffDays} days`;
+};
+
+const getSubjectIcon = (subject: string) => {
+  const s = normalizeSubject(subject);
+  if (s === 'ARABIC') return Icons.Eagle;
+  if (s === 'BIOLOGY') return Icons.Dna;
+  if (s === 'GERMAN') return Icons.Languages;
+  if (s === 'SOCIAL STUDIES') return Icons.Globe;
+  if (s === 'RELIGION' || s === 'ISLAMIC STUDIES') return Icons.Library;
+  if (s === 'ARABIC HISTORY') return Icons.History;
+  if (s === 'PHYSICAL EDUCATION') return Icons.Dumbbell;
+  if (s === 'INFORMATION TECHNOLOGY') return Icons.Monitor;
+  if (s === 'MATH') return Icons.Sigma;
+  if (s === 'ENGLISH') return Icons.Edit;
+  if (s === 'ART') return Icons.Palette;
+  return Icons.Flash;
+};
+
+const processMath = (text: string): string => {
+  if (!text || !window.katex) return text;
+  let p = text;
+  p = p.replace(/\$\$(.*?)\$\$/gs, (match, formula) => { try { return window.katex.renderToString(formula.trim(), { throwOnError: false, displayMode: true }); } catch (e) { return match; } });
+  p = p.replace(/\$(.*?)\$/g, (match, formula) => { try { return window.katex.renderToString(formula.trim(), { throwOnError: false, displayMode: false }); } catch (e) { return match; } });
+  p = p.replace(/\\\((.*?)\\\)/gs, (match, formula) => { try { return window.katex.renderToString(formula.trim(), { throwOnError: false, displayMode: false }); } catch (e) { return match; } });
+  p = p.replace(/\\\[(.*?)\\\]/gs, (match, formula) => { try { return window.katex.renderToString(formula.trim(), { throwOnError: false, displayMode: true }); } catch (e) { return match; } });
+  p = p.replace(/\\sqrt\{(.*?)\}/g, '√($1)');
+  p = p.replace(/\^([23nxy])/g, (match, char) => { const supers: any = { '2': '²', '3': '³', 'n': 'ⁿ', 'x': 'ˣ', 'y': 'ʸ' }; return supers[char] || match; });
+  p = p.replace(/\\frac\{(.*?)\}\{(.*?)\}/g, '($1)/($2)');
+  return p;
+};
+
+const useGoogleDrive = () => {
+  const [token, setToken] = useState<string | null>(localStorage.getItem('google_drive_token'));
+
+  const initTokenClient = useCallback(() => {
+    return window.google.accounts.oauth2.initTokenClient({
+      client_id: "280892616112-jpvv3ntvefvdsqju249o42l1agt3mans.apps.googleusercontent.com",
+      scope: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly',
+      callback: (response: any) => {
+        if (response.access_token) {
+          setToken(response.access_token);
+          localStorage.setItem('google_drive_token', response.access_token);
+          playUISound('success');
+        }
+      },
+    });
+  }, []);
+
+  const connect = () => { const client = initTokenClient(); client.requestAccessToken(); };
+  const disconnect = () => { setToken(null); localStorage.removeItem('google_drive_token'); playUISound('switch'); };
+
+  const getFileContent = async (fileId: string, mimeType: string): Promise<string> => {
+    if (!token) return '';
+    try {
+      if (mimeType === 'application/vnd.google-apps.document') {
+        // @ts-ignore
+        const response = await window.gapi.client.drive.files.export({
+          fileId: fileId,
+          mimeType: 'text/plain'
+        });
+        return response.body;
+      }
+      if (mimeType === 'text/plain') {
+        // @ts-ignore
+        const response = await window.gapi.client.drive.files.get({
+          fileId: fileId,
+          alt: 'media'
+        });
+        return response.body;
+      }
+    } catch (e) {
+      console.error(`Error fetching content for file ${fileId}:`, e);
+    }
+    return '';
+  };
+
+  const openPicker = (onSelect: (files: Attachment[]) => void) => {
+    if (!token) {
+      connect();
+      return;
+    }
+
+    const showPicker = () => {
+      const view = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS).setMimeTypes('application/vnd.google-apps.document,text/plain,application/pdf,image/png,image/jpeg');
+      const picker = new window.google.picker.PickerBuilder()
+        .enableFeature(window.google.picker.Feature.MULTISELECT_ENABLED)
+        .setAppId("280892616112-jpvv3ntvefvdsqju249o42l1agt3mans.apps.googleusercontent.com")
+        .setOAuthToken(token)
+        .addView(view)
+        .addView(new window.google.picker.DocsUploadView())
+        .setDeveloperKey(process.env.GOOGLE_API_KEY || "")
+        .setCallback(async (data: any) => {
+          if (data.action === window.google.picker.Action.PICKED) {
+            const attachments: Attachment[] = [];
+            for (const doc of data.docs) {
+              const extractedText = await getFileContent(doc.id, doc.mimeType);
+              attachments.push({
+                name: doc.name,
+                type: 'drive',
+                url: doc.url,
+                driveId: doc.id,
+                extractedText: extractedText || `[Reference material: ${doc.name}]`
+              });
+            }
+            onSelect(attachments);
+            playUISound('success');
+          }
+        })
+        .build();
+      picker.setVisible(true);
+    };
+
+    if (window.gapi && window.gapi.load) {
+      window.gapi.load('client:picker', () => {
+        window.gapi.client.init({
+          apiKey: process.env.GOOGLE_API_KEY || "",
+          discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"],
+        }).then(showPicker, (err: any) => console.error("Error initializing GAPI client:", err));
+      });
+    } else {
+      console.error("GAPI script not loaded");
+    }
+  };
+
+  return { token, connect, disconnect, openPicker };
+};
+
+const TOUR_STEPS: TourStep[] = [
+  { target: '#tour-board-header', title: 'Tactical Board', content: 'Central matrix for active assignments. Your command center.', position: 'bottom' },
+  { target: '#tour-stats-header', title: 'Intelligence Matrix', content: 'Real-time performance analytics derived from synced grades. This only appears when you have active assignments.', position: 'bottom' },
+  { target: '#tour-new-objective', title: 'Uplink Signal', content: 'Manually add tasks or scan portal screenshots to populate the board.', position: 'left' },
+  { target: '#tour-grades-nav', title: 'The Vault', content: 'Synchronize school portal grades to unlock deep analytics.', position: 'right' },
+  { target: '#tour-simulator-nav', title: 'Grade Simulator', content: 'Quantify the tactical impact of future assignments on your final grades.', position: 'right' },
+  { target: '#tour-pulse-nav', title: 'Pulse AI', content: 'On your first visit each day, Pulse shows a daily objective brief. Clicking the Pulse icon on an assignment auto-selects the correct AI protocol.', position: 'right' },
+];
+
+interface TourStep { target: string; title: string; content: string; position: 'top' | 'bottom' | 'left' | 'right' | 'center'; }
+
+const OnboardingTour: React.FC<{ onComplete: () => void; reduceMotion: boolean; }> = ({ onComplete, reduceMotion }) => {
+  const [step, setStep] = useState(0);
+  const [coords, setCoords] = useState<{ x: number, y: number, w: number, h: number } | null>(null);
+  const currentStep = TOUR_STEPS[step];
+  const updateCoords = useCallback(() => {
+    if (currentStep.target === 'center') { setCoords(null); return; }
+    const el = document.querySelector(currentStep.target);
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      setCoords({ x: rect.left, y: rect.top, w: rect.width, h: rect.height });
+      el.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+    }
+  }, [currentStep, reduceMotion]);
+  useEffect(() => {
+    updateCoords(); window.addEventListener('resize', updateCoords); window.addEventListener('scroll', updateCoords, true);
+    return () => { window.removeEventListener('resize', updateCoords); window.removeEventListener('scroll', updateCoords, true); };
+  }, [updateCoords]);
+  const handleNext = () => {
+    playUISound('action');
+    if (step < TOUR_STEPS.length - 1) setStep(s => s + 1);
+    else onComplete();
+  };
+  const handleSkip = () => { playUISound('switch'); onComplete(); };
+  return createPortal(
+    <div className="fixed inset-0 z-[1000] pointer-events-none">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-black/60 pointer-events-auto" style={{ clipPath: coords ? `polygon(0% 0%, 0% 100%, ${coords.x}px 100%, ${coords.x}px ${coords.y}px, ${coords.x + coords.w}px ${coords.y}px, ${coords.x + coords.w}px ${coords.y + coords.h}px, ${coords.x}px ${coords.y + coords.h}px, ${coords.x}px 100%, 100% 100%, 100% 0%)` : 'none' }} onClick={handleSkip} />
+      <AnimatePresence mode="wait">
+        {coords && <motion.div key={`border-${step}`} initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} className="absolute border-2 border-blue-500 rounded-2xl shadow-[0_0_30px_rgba(59,130,246,0.5)]" style={{ left: coords.x - 8, top: coords.y - 8, width: coords.w + 16, height: coords.h + 16 }} />}
+      </AnimatePresence>
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none p-4 sm:p-10">
+        <motion.div key={`step-${step}`} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="pointer-events-auto w-full max-w-sm bg-white dark:bg-[#151515] border border-gray-100 dark:border-white/10 rounded-[2.5rem] p-8 shadow-2xl space-y-6" style={coords && window.innerWidth > 768 ? { position: 'absolute', left: currentStep.position === 'right' ? coords.x + coords.w + 40 : 'auto', top: currentStep.position === 'bottom' ? coords.y + coords.h + 40 : 'auto', transform: 'none' } : {}}>
+          <div className="flex items-center justify-between"><span className="text-[10px] font-bold uppercase tracking-[0.2em] text-blue-500">{String(step + 1).padStart(2, '0')} / {String(TOUR_STEPS.length).padStart(2, '0')}</span><button onClick={handleSkip} className="text-[10px] font-bold uppercase tracking-widest text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors">Skip Tour</button></div>
+          <div className="space-y-2"><h3 className="text-xl font-bold tracking-tight">{currentStep.title}</h3><p className="text-sm text-gray-500 font-medium leading-relaxed">{currentStep.content}</p></div>
+          <div className="pt-2"><button onClick={handleNext} className="w-full py-4 bg-gray-900 dark:bg-white text-white dark:text-black rounded-2xl text-[10px] font-bold uppercase tracking-[0.2em] hover:opacity-90 transition-opacity">{step === TOUR_STEPS.length - 1 ? 'Begin Protocol' : 'Next Protocol'}</button></div>
+        </motion.div>
+      </div>
+    </div>, document.body
+  );
+};
+
+const MandatoryPortalSetupModal: React.FC<{ onComplete: (email: string, pass: string) => void }> = ({ onComplete }) => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [status, setStatus] = useState<'idle' | 'submitting' | 'success'>('idle');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (email && password && status === 'idle') {
+      setStatus('submitting');
+      playUISound('action');
+      await new Promise(resolve => setTimeout(resolve, 800));
+      setStatus('success');
+      playUISound('success');
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      onComplete(email, password);
+    }
+  };
+
+  return createPortal(
+    <div className="fixed inset-0 z-[1200] flex items-center justify-center p-4 sm:p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 bg-black/95 backdrop-blur-3xl" />
+      <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="relative w-full max-w-xl bg-white dark:bg-[#0d0d0d] rounded-3xl sm:rounded-[3rem] p-8 sm:p-10 lg:p-16 border border-white/10 shadow-2xl text-center">
+        <Icons.Bolt className="w-16 h-16 mx-auto text-blue-500 mb-8" />
+        <h2 className="text-3xl font-bold tracking-tighter mb-4">Auto Bridge Setup.</h2>
+        <p className="text-sm text-gray-500 font-medium mb-12">Deployment synchronization required: Configure your school portal credentials to enable automated assignment tracking and submissions.</p>
+        <form onSubmit={handleSubmit}>
+          <motion.div
+            animate={{ opacity: status === 'success' ? 0 : 1, filter: status === 'success' ? 'blur(4px)' : 'blur(0px)' }}
+            transition={{ duration: 0.4 }}
+            className="space-y-6 text-left mb-10"
+          >
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder="operator@school.edu"
+                disabled={status !== 'idle'}
+                className="w-full bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 p-6 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium disabled:opacity-50"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                placeholder="••••••••"
+                disabled={status !== 'idle'}
+                className="w-full bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 p-6 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium disabled:opacity-50"
+              />
+            </div>
+          </motion.div>
+          <button
+            type="submit"
+            disabled={!email || !password || status !== 'idle'}
+            className="w-full py-8 bg-blue-600 text-white rounded-[2.5rem] font-bold uppercase tracking-[0.2em] shadow-xl shadow-blue-500/20 active:scale-95 transition-all disabled:opacity-40 flex items-center justify-center"
+            style={{ height: '80px' }}
+          >
+            <AnimatePresence mode="wait">
+              {status === 'idle' && <motion.span key="idle" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>Initialize Bridge</motion.span>}
+              {status === 'submitting' && <motion.div key="submitting" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}><Icons.Spinner className="w-6 h-6" /></motion.div>}
+              {status === 'success' && <motion.div key="success" initial={{ opacity: 0, scale: 0.5 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}><Icons.Check className="w-8 h-8" /></motion.div>}
+            </AnimatePresence>
+          </button>
+        </form>
+      </motion.div>
+    </div>, document.body
+  );
+};
+
+const ClassSelectionModal: React.FC<{ onSelect: (c: UserClass) => void }> = ({ onSelect }) => {
+  const classes: UserClass[] = ['10A', '10B', '10C', '10D'];
+  return createPortal(
+    <div className="fixed inset-0 z-[1100] flex items-center justify-center p-4 sm:p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 bg-black/95 backdrop-blur-2xl" />
+      <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[2.5rem] sm:rounded-[4rem] p-8 sm:p-16 border border-white/10 shadow-2xl text-center max-h-[90vh] overflow-y-auto">
+        <Icons.School className="w-12 h-12 sm:w-16 sm:h-16 mx-auto text-blue-500 mb-6 sm:mb-8" />
+        <h2 className="text-2xl sm:text-4xl font-bold tracking-tighter mb-4">Select Deployment Class.</h2>
+        <p className="text-sm sm:text-base text-gray-500 font-medium mb-8 sm:mb-12">Synchronize your tactical schedule with your active school section.</p>
+        <div className="grid grid-cols-2 gap-4 sm:gap-6">
+          {classes.map(c => (
+            <button key={c} onClick={() => { playUISound('success'); onSelect(c); }} className="py-6 sm:py-10 bg-gray-100 dark:bg-white/5 border border-white/5 rounded-[1.5rem] sm:rounded-[2.5rem] text-xl sm:text-3xl font-bold hover:border-blue-500/50 hover:bg-blue-500/5 transition-all active:scale-95 group">
+              <span className="group-hover:text-blue-500 transition-colors">{c}</span>
+            </button>
+          ))}
+        </div>
+      </motion.div>
+    </div>, document.body
+  );
+};
+
+const FirstSyncModal: React.FC<{ onClose: () => void; onConfirm: () => void; }> = ({ onClose, onConfirm }) => (
+  createPortal(
+    <div className="fixed inset-0 z-[1200] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" />
+      <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="relative w-full max-w-lg bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-14 text-center border border-white/5 shadow-2xl">
+        <Icons.Clipboard className="w-16 h-16 mx-auto text-blue-500 mb-8" />
+        <h2 className="text-4xl font-bold tracking-tighter mb-4">Bridge Initialized.</h2>
+        <p className="text-gray-500 font-medium mb-12 leading-relaxed text-lg">Your portal connection is active. Perform your first grade synchronization to unlock performance analytics and the simulator.</p>
+        <button onClick={onConfirm} className="w-full py-6 rounded-2xl font-bold uppercase tracking-widest text-white text-sm shadow-xl bg-blue-600 shadow-blue-500/20">
+          Go to Grades
+        </button>
+      </motion.div>
+    </div>,
+    document.body
+  )
+);
+
+interface SimulatorSectionProps {
+  simulationMode: 'skip' | 'work';
+  setSimulationMode: (mode: 'skip' | 'work') => void;
+  selectedSubject: string;
+  setSelectedSubject: (subject: string) => void;
+  category: keyof typeof WEIGHTS;
+  setCategory: (category: keyof typeof WEIGHTS) => void;
+  numToSimulate: string;
+  setNumToSimulate: (num: string) => void;
+  itemCount: string;
+  setItemCount: (count: string) => void;
+  hypotheticalScore: string;
+  setHypotheticalScore: (score: string) => void;
+}
+
+// --- Simulator Section Logic ---
+const SimulatorSection: React.FC<SimulatorSectionProps> = ({
+  simulationMode, setSimulationMode, selectedSubject, setSelectedSubject,
+  category, setCategory, numToSimulate, setNumToSimulate, itemCount,
+  setItemCount, hypotheticalScore, setHypotheticalScore
+}) => {
+  const gradesDataString = localStorage.getItem('flash-grades');
+  const grades = useMemo(() => gradesDataString ? JSON.parse(gradesDataString) : [], [gradesDataString]);
+  const isLocked = grades.length === 0;
+
+  useEffect(() => {
+    setItemCount(String(DEFAULT_COUNTS[category] || 5));
+    setNumToSimulate('1');
+  }, [category, setItemCount, setNumToSimulate]);
+
+  useEffect(() => {
+    if (simulationMode === 'skip') {
+      setHypotheticalScore('0');
+    } else {
+      setHypotheticalScore('100');
+    }
+  }, [simulationMode, setHypotheticalScore]);
+
+  const getGPA = (percent: number) => {
+    if (percent >= 93) return 4.0;
+    if (percent >= 90) return 3.7;
+    if (percent >= 87) return 3.3;
+    if (percent >= 83) return 3.0;
+    if (percent >= 80) return 2.7;
+    if (percent >= 77) return 2.3;
+    if (percent >= 73) return 2.0;
+    if (percent >= 70) return 1.7;
+    if (percent >= 67) return 1.3;
+    if (percent >= 63) return 1.0;
+    return 0.0;
+  };
+
+  const getLetter = (percent: number) => {
+    if (percent >= 97) return 'A+';
+    if (percent >= 93) return 'A';
+    if (percent >= 90) return 'A-';
+    if (percent >= 87) return 'B+';
+    if (percent >= 83) return 'B';
+    if (percent >= 80) return 2.7;
+    if (percent >= 77) return 'C+';
+    if (percent >= 73) return 'C';
+    if (percent >= 70) return 'C-';
+    if (percent >= 67) return 'D+';
+    if (percent >= 63) return 'D';
+    return 'Fail';
+  };
+
+  const currentGradeObj = grades.find((g: any) => g.subject === selectedSubject);
+  const currentTotal = currentGradeObj ? parseFloat(currentGradeObj.grade.replace('%', '')) : 85;
+
+  const calculateResult = () => {
+    const score = parseFloat(hypotheticalScore) || 0;
+    const totalItems = parseInt(itemCount) || 1;
+    const numSimulated = Math.min(parseInt(numToSimulate) || 0, totalItems);
+    const weight = WEIGHTS[category];
+    const currentOverallGrade = currentTotal;
+
+    const itemsAlreadyGraded = totalItems - numSimulated;
+
+    const currentCategorySum = currentOverallGrade * itemsAlreadyGraded;
+    const simulatedSum = score * numSimulated;
+    const newCategoryTotalSum = currentCategorySum + simulatedSum;
+
+    const newCategoryAverage = totalItems > 0 ? newCategoryTotalSum / totalItems : 0;
+
+    const oldCategoryContribution = currentOverallGrade * weight;
+    const newCategoryContribution = newCategoryAverage * weight;
+
+    const deltaToOverallGrade = newCategoryContribution - oldCategoryContribution;
+    const newOverallGrade = currentOverallGrade + deltaToOverallGrade;
+
+    return {
+      oldGrade: currentTotal,
+      oldLetter: getLetter(currentTotal),
+      oldGPA: getGPA(currentTotal),
+      newGrade: newOverallGrade,
+      newLetter: getLetter(newOverallGrade),
+      newGPA: getGPA(newOverallGrade),
+      difference: newOverallGrade - currentTotal
+    };
+  };
+
+  const result = calculateResult();
+  const isGain = result.difference >= 0;
+
+  if (isLocked) {
+    return (
+      <div className="max-w-4xl mx-auto py-40 text-center space-y-8">
+        <Icons.Lock className="w-24 h-24 mx-auto text-rose-500 opacity-20" />
+        <div className="space-y-2">
+          <h2 className="text-4xl font-bold tracking-tighter">Simulator Locked.</h2>
+          <p className="text-gray-500 font-medium max-w-sm mx-auto leading-relaxed">The Simulation Matrix requires active grade synchronization. Navigate to the Grades Tab and refresh your academic profile to authorize access.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-8 sm:space-y-12 lg:space-y-16 pb-20 sm:pb-32">
+      <div>
+        <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tighter mb-3 sm:mb-4">Grade Simulator.</h1>
+        <p className="text-gray-400 text-lg sm:text-xl font-medium">Quantify the tactical impact of future academic assignments.</p>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 sm:gap-10 lg:gap-12">
+        <div className="space-y-8">
+          <SettingsGroup title="Intelligence Ingestion">
+            <div className="p-8 space-y-8">
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Simulation Mode</label>
+                <div className="bg-gray-100 dark:bg-white/5 p-1.5 rounded-[2.5rem] border border-gray-200 dark:border-white/10 shadow-inner flex">
+                  <button onClick={() => { setSimulationMode('skip'); playUISound('switch'); }} className={`flex-1 py-4 rounded-[2rem] text-sm font-bold transition-all ${simulationMode === 'skip' ? 'bg-rose-600/10 text-rose-500 shadow-md' : 'text-gray-400'}`}>
+                    Skip Work
+                  </button>
+                  <button onClick={() => { setSimulationMode('work'); playUISound('switch'); }} className={`flex-1 py-4 rounded-[2rem] text-sm font-bold transition-all ${simulationMode === 'work' ? 'bg-green-600/10 text-green-500 shadow-md' : 'text-gray-400'}`}>
+                    Do Work
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Target Class</label>
+                <CustomSelect
+                  value={selectedSubject}
+                  onChange={setSelectedSubject}
+                  options={grades.map((g: any) => ({
+                    value: g.subject,
+                    label: `${g.subject} (${Math.round(parseFloat(g.grade))})`
+                  }))}
+                  placeholder="Select deployment class"
+                />
+              </div>
+
+              {selectedSubject && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Operation Category</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      {(Object.keys(WEIGHTS) as Array<keyof typeof WEIGHTS>).map(cat => (
+                        <button
+                          key={cat}
+                          onClick={() => { setCategory(cat); playUISound('switch'); }}
+                          className={`py-4 px-4 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all border ${category === cat ? 'bg-blue-600 border-blue-600 text-white shadow-lg shadow-blue-500/20' : 'bg-gray-50 dark:bg-white/5 border-transparent text-gray-400 hover:border-white/10'}`}
+                        >
+                          {cat} ({WEIGHTS[cat] * 100}%)
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Assignments to Simulate</label>
+                    <input
+                      type="number"
+                      value={numToSimulate}
+                      onChange={e => setNumToSimulate(e.target.value)}
+                      className="w-full bg-gray-50 dark:bg-white/5 border border-transparent dark:border-white/10 p-5 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-bold"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Total in Category</label>
+                      <input
+                        type="number"
+                        value={itemCount}
+                        onChange={e => setItemCount(e.target.value)}
+                        className="w-full bg-gray-50 dark:bg-white/5 border border-transparent dark:border-white/10 p-5 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-bold"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4 block">Score for Each (%)</label>
+                      <input
+                        type="number"
+                        value={hypotheticalScore}
+                        onChange={e => setHypotheticalScore(e.target.value)}
+                        placeholder={simulationMode === 'skip' ? "0" : "100"}
+                        disabled={simulationMode === 'skip'}
+                        className={`w-full bg-gray-50 dark:bg-white/5 border border-transparent dark:border-white/10 p-5 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-bold transition-colors ${simulationMode === 'skip' ? 'text-rose-500' : 'text-green-500'
+                          } ${simulationMode === 'skip' ? 'cursor-not-allowed' : ''}`}
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </SettingsGroup>
+        </div>
+
+        <div className="space-y-8">
+          <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] p-10 space-y-10 shadow-2xl h-full flex flex-col justify-center">
+            {!selectedSubject ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-center opacity-30 space-y-4">
+                <Icons.Sigma className="w-16 h-16" />
+                <p className="text-sm font-black uppercase tracking-[0.3em]">Initialize Tactical Data</p>
+              </div>
+            ) : (
+              <div className="space-y-10">
+                <div className="space-y-6">
+                  <div className="flex items-center gap-3">
+                    <div className="w-1.5 h-8 bg-blue-500 rounded-full" />
+                    <span className="text-xl font-bold tracking-tight uppercase">{selectedSubject} Impact report</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-8">
+                    <div className="space-y-1 p-6 bg-gray-50 dark:bg-white/5 rounded-2xl border border-transparent dark:border-white/5">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-gray-400">Baseline</p>
+                      <p className="text-4xl font-black">{result.oldGrade.toFixed(1)}%</p>
+                      <p className="text-xs font-bold text-gray-500 uppercase tracking-widest mt-1">{result.oldLetter} / {result.oldGPA.toFixed(1)} GPA</p>
+                    </div>
+                    <div className={`space-y-1 p-6 rounded-2xl border ${isGain ? 'bg-green-500/5 dark:bg-green-500/10 border-green-500/10' : 'bg-rose-500/5 dark:bg-rose-500/10 border-rose-500/20'}`}>
+                      <p className={`text-[10px] font-black uppercase tracking-widest ${isGain ? 'text-green-500' : 'text-rose-500'}`}>Projected</p>
+                      <p className={`text-4xl font-black ${isGain ? 'text-green-500' : 'text-rose-500'}`}>{result.newGrade.toFixed(1)}%</p>
+                      <p className={`text-xs font-bold uppercase tracking-widest mt-1 ${isGain ? 'text-green-400' : 'text-rose-400'}`}>{result.newLetter} / {result.newGPA.toFixed(1)} GPA</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`p-8 rounded-[2.5rem] text-white shadow-2xl space-y-6 relative overflow-hidden group ${isGain ? 'bg-emerald-600' : 'bg-rose-600'}`}>
+                  <Icons.Flash className="absolute -right-8 -top-8 w-40 h-40 opacity-10 rotate-12 group-hover:rotate-45 transition-transform duration-1000" />
+                  <div className="relative z-10 space-y-4">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em] opacity-60">Impact Visualization</p>
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-7xl font-black">{isGain ? '+' : ''}{result.difference.toFixed(1)}%</span>
+                      <span className="text-xl font-bold opacity-80 uppercase tracking-widest">{isGain ? 'Boost' : 'Hit'}</span>
+                    </div>
+                    <p className="text-lg font-medium leading-relaxed">
+                      {isGain
+                        ? <>Completing {numToSimulate} {category} with {hypotheticalScore}% boosts your profile from <span className="font-black underline">{result.oldGrade.toFixed(0)}% {result.oldLetter}</span> to <span className="font-black underline">{result.newGrade.toFixed(0)}% {result.newLetter}</span>.</>
+                        : <>Skipping {numToSimulate} {category} drops your profile from <span className="font-black underline">{result.oldGrade.toFixed(0)}% {result.oldLetter}</span> to <span className="font-black underline">{result.newGrade.toFixed(0)}% {result.newLetter}</span>.</>
+                      }
+                    </p>
+                    <div className="pt-6 border-t border-white/20 flex items-center justify-between">
+                      <span className="text-[10px] font-black uppercase tracking-widest opacity-60">Revised GPA</span>
+                      <span className="text-3xl font-black">{result.newGPA.toFixed(1)}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Main Dashboard Components ---
+
+const HomeworkScraperModal: React.FC<{ isOpen: boolean; onClose: () => void; reduceMotion: boolean; onImport: (assignments: Assignment[]) => void }> = ({ isOpen, onClose, reduceMotion, onImport }) => {
+  const [email, setEmail] = useState(() => localStorage.getItem('flash-operator-email') || '');
+  const [password, setPassword] = useState(() => localStorage.getItem('flash-operator-password') || '');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleScrape = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!email || !password) return;
+    setIsLoading(true); setError(null); playUISound('action');
+    try {
+      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-schoolwork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication Failed: Check Portal Credentials.');
+        }
+        throw new Error('Network response was not ok');
+      }
+
+      const data = await response.json();
+      const rawText = data.markdown || data.text || (typeof data === 'string' ? data : JSON.stringify(data));
+      const parsedAssignments = await parseRawTextToAssignments(rawText);
+      if (parsedAssignments.length > 0) {
+        onImport(parsedAssignments.map(a => ({ ...a, subject: normalizeSubject(a.subject) })));
+      } else {
+        setError('Uplink synchronized, but no actionable tactical objectives identified. Verify portal visibility.');
+        playUISound('error');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Uplink failed. The backend service may be offline or credentials rejected.');
+      playUISound('error');
+    } finally { setIsLoading(false); }
+  };
+
+  if (!isOpen) return null;
+  return createPortal(
+    <div className="fixed inset-0 z-[300] flex items-center justify-center p-4 sm:p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={isLoading ? undefined : onClose} className="absolute inset-0 bg-black/95 backdrop-blur-2xl" />
+      <motion.div initial={{ opacity: 0, scale: 0.9, y: 30 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 30 }} className="relative w-full max-w-4xl bg-white dark:bg-[#0d0d0d] rounded-3xl sm:rounded-[4rem] p-8 sm:p-12 lg:p-16 border border-white/10 shadow-2xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-8">
+          <div className="space-y-2"><h2 className="text-4xl font-bold tracking-tighter">Portal.</h2><p className="text-gray-500 font-medium">Automatic extraction from school portal systems.</p></div>
+          {!isLoading && <button onClick={onClose} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button>}
+        </div>
+        <div className="mb-12 p-8 bg-amber-500/5 border border-amber-500/20 rounded-[2.5rem] flex items-start gap-6">
+          <div className="w-12 h-12 rounded-2xl bg-amber-500/10 flex items-center justify-center text-amber-500 shrink-0"><Icons.Error className="w-6 h-6" /></div>
+          <div className="space-y-1"><p className="text-xs font-black uppercase tracking-widest text-amber-500">Operation Protocol Warning</p><p className="text-sm text-amber-600/80 dark:text-amber-400/60 font-medium leading-relaxed">Please <span className="text-amber-500 font-bold">end any active school portal sessions</span> (PlusPortals, etc.) before proceeding to prevent identity collision. This feature is in beta: expect occasional uplink instability or materialization errors.</p></div>
+        </div>
+        <form onSubmit={handleScrape} className="space-y-8 max-w-md mx-auto py-4">
+          <div className="space-y-6">
+            <div className="space-y-2"><label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Email</label><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="operator@school.edu" className="w-full bg-gray-50 dark:bg-white/5 border border-white/5 p-7 rounded-[2.5rem] outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium" required disabled={isLoading} /></div>
+            <div className="space-y-2"><label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Password</label><input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" className="w-full bg-gray-50 dark:bg-white/5 border border-white/5 p-7 rounded-[2.5rem] outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium" required disabled={isLoading} /></div>
+          </div>
+          {error && <div className="p-6 bg-rose-500/10 border border-rose-500/20 rounded-[2rem] text-rose-500 text-sm font-bold flex gap-4 items-center"><Icons.Error className="w-5 h-5 shrink-0" /><span>{error}</span></div>}
+          <button disabled={isLoading || !email || !password} className="w-full py-8 rounded-[3rem] bg-black dark:bg-white text-white dark:text-black font-bold uppercase tracking-[0.2em] shadow-2xl active:scale-95 transition-all text-sm flex items-center justify-center gap-3 disabled:opacity-50">{isLoading ? <Icons.Spinner className="w-5 h-5" /> : <Icons.School className="w-5 h-5" />}<span>{isLoading ? "Executing Portal Scan..." : "Synchronize Portal"}</span></button>
+          {isLoading && <p className="text-center text-[10px] font-bold uppercase tracking-widest text-blue-500 animate-pulse mt-4">AI is materializing tactical board data. Do not disconnect.</p>}
+        </form>
+      </motion.div>
+    </div>, document.body
+  );
+};
+
+const LoadingBar: React.FC<{ isVisible: boolean; progress: number; label?: string }> = ({ isVisible, progress, label }) => (
+  <AnimatePresence>
+    {isVisible && (
+      <motion.div
+        initial={{ opacity: 0, x: 20 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: 20 }}
+        className="fixed bottom-8 right-8 z-[200] w-80"
+      >
+        <div className="bg-white dark:bg-[#0d0d0d] border border-gray-200 dark:border-white/10 rounded-2xl p-5 shadow-2xl backdrop-blur-xl">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold uppercase tracking-wider text-gray-500">
+              {label || 'Loading'}
+            </span>
+            <span className="text-xs font-bold tabular-nums text-blue-500">
+              {Math.round(progress)}%
+            </span>
+          </div>
+          <div className="w-full h-1.5 bg-gray-100 dark:bg-white/5 rounded-full overflow-hidden">
+            <motion.div
+              animate={{ width: `${progress}%` }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full"
+            />
+          </div>
+        </div>
+      </motion.div>
+    )}
+  </AnimatePresence>
+);
+
+const EmptyState: React.FC<{ title: string; desc: string; onClick?: () => void; isHistory?: boolean; }> = ({ title, desc, onClick, isHistory }) => (
+  <div className="flex flex-col items-center justify-center py-40 text-center space-y-8">
+    <motion.div
+      animate={{ y: [-4, 4, -4] }}
+      transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+      className="w-24 h-24 rounded-full bg-gray-100 dark:bg-white/5 flex items-center justify-center text-gray-400"
+    >
+      {isHistory ? <Icons.History className="w-10 h-10" /> : <Icons.Activity className="w-10 h-10" />}
+    </motion.div>
+    <div className="space-y-2"><h3 className="text-3xl font-bold tracking-tighter">{title}</h3><p className="text-gray-500 font-medium max-w-sm mx-auto">{desc}</p></div>
+    {onClick && <button onClick={onClick} className="px-8 py-4 bg-blue-500 text-white rounded-2xl font-bold uppercase tracking-widest text-xs hover:bg-blue-600 transition-colors">Begin Protocol</button>}
+  </div>
+);
+
+const UndoToast: React.FC<{ visible: boolean; onUndo: () => void }> = ({ visible, onUndo }) => (
+  <AnimatePresence>
+    {visible && <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 50 }} className="fixed bottom-12 left-1/2 -translate-x-1/2 z-[500] bg-gray-900 dark:bg-white text-white dark:text-black px-8 py-5 rounded-[2rem] shadow-2xl flex items-center gap-6 border border-white/10"><span className="text-xs font-bold uppercase tracking-widest">Entry Scrubbed.</span><button onClick={onUndo} className="flex items-center gap-2 text-blue-500 dark:text-blue-600 font-bold uppercase tracking-widest text-[10px] hover:opacity-80 transition-opacity"><Icons.Restore className="w-3 h-3" /><span>Restore</span></button></motion.div>}
+  </AnimatePresence>
+);
+
+const SubjectSection: React.FC<{ subject: string; items: Assignment[]; initialCollapsed?: boolean; renderCard: (a: Assignment) => React.ReactNode; isOverdue?: boolean; }> = ({ subject, items, initialCollapsed = false, renderCard, isOverdue }) => {
+  const [isCollapsed, setIsCollapsed] = useState(() => {
+    const saved = localStorage.getItem(`flash-collapse-${subject}`);
+    return saved !== null ? saved === 'true' : initialCollapsed;
+  });
+  const titleColor = isOverdue ? "text-rose-500" : "opacity-20 group-hover:opacity-40";
+  const SubjectIcon = getSubjectIcon(subject);
+
+  return (
+    <div className="space-y-12">
+      <button onClick={() => {
+        const newState = !isCollapsed;
+        setIsCollapsed(newState);
+        localStorage.setItem(`flash-collapse-${subject}`, String(newState));
+        playUISound('switch');
+      }} className="flex items-center justify-between w-full group py-4 border-b border-gray-100 dark:border-white/5 outline-none">
+        <div className="flex items-center gap-6">
+          <SubjectIcon className={`w-10 h-10 transition-colors ${isOverdue ? 'text-rose-500/40' : 'text-gray-900/10 dark:text-white/10'}`} />
+          <h2 className={`text-4xl font-bold tracking-tighter transition-opacity uppercase ${titleColor}`}>
+            {subject}
+          </h2>
+          {isCollapsed && <span className="text-xs font-bold uppercase tracking-widest text-gray-400 opacity-60">· {items.length}</span>}
+        </div>
+        <motion.div animate={{ rotate: isCollapsed ? 0 : 90 }} transition={{ duration: 0.2 }} className="text-gray-400 opacity-20 group-hover:opacity-40"><Icons.ChevronRight className="w-6 h-6" /></motion.div>
+      </button>
+      <AnimatePresence initial={false}>
+        {!isCollapsed && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2, ease: "easeInOut" }} className="overflow-hidden"><div className="grid grid-cols-1 lg:grid-cols-2 gap-16 pt-4 pb-12">{items.map(renderCard)}</div></motion.div>}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+const LeaderboardSection: React.FC<{ currentUser: UserProfile }> = ({ currentUser }) => {
+  const [globalLeaderboard, setGlobalLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+
+  // Subscribe to real-time leaderboard updates
+  useEffect(() => {
+    const unsubscribe = subscribeToLeaderboard(
+      (entries) => {
+        setGlobalLeaderboard(entries);
+        setLoading(false);
+      },
+      (err) => {
+        setError(err.message);
+        setLoading(false);
+        playUISound('error');
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  // Sync current user's XP to global leaderboard
+  const handleSyncXP = async () => {
+    setSyncing(true);
+    setError(null);
+
+    try {
+      await submitScore(currentUser.displayName, currentUser.xp);
+      setLastSyncTime(new Date());
+      playUISound('success');
+    } catch (err: any) {
+      setError(err.message);
+      playUISound('error');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const getRankContent = (index: number) => { if (index === 0) return { medal: '🥇', color: 'text-amber-400' }; if (index === 1) return { medal: '🥈', color: 'text-slate-400' }; if (index === 2) return { medal: '🥉', color: 'text-amber-700' }; return null; };
+  const getTier = (index: number) => { const rank = index + 1; if (rank === 1) return { label: 'Gold', color: 'text-amber-400 bg-amber-400/10' }; if (rank === 2) return { label: 'Silver', color: 'text-slate-400 bg-slate-400/10' }; if (rank === 3) return { label: 'Bronze', color: 'text-amber-700 bg-amber-700/10' }; if (rank <= 10) return { label: 'Elite', color: 'text-blue-500 bg-blue-500/10' }; return { label: 'Standard', color: 'text-gray-400 bg-gray-400/10' }; };
+
+  const userRank = getUserRank(globalLeaderboard, currentUser.uid);
+  const isUserOnBoard = globalLeaderboard.some(entry => entry.uid === currentUser.uid);
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-8 sm:space-y-12 lg:space-y-16 pb-20 sm:pb-32">
+      <div className="flex items-end justify-between">
+        <div>
+          <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tighter mb-3 sm:mb-4">Global Leaderboard.</h1>
+          <p className="text-gray-400 text-lg sm:text-xl font-medium">Real-time rankings across all Flash users worldwide.</p>
+        </div>
+        <button
+          onClick={handleSyncXP}
+          disabled={syncing || loading}
+          className={`flex items-center gap-3 px-6 py-3 rounded-2xl font-bold text-sm transition-all ${syncing || loading
+            ? 'bg-gray-100 dark:bg-white/5 text-gray-400 cursor-not-allowed'
+            : 'bg-blue-600 hover:bg-blue-700 text-white'
+            }`}
+        >
+          {syncing ? (
+            <>
+              <Icons.Spinner className="w-4 h-4" />
+              <span>Syncing...</span>
+            </>
+          ) : (
+            <>
+              <Icons.UploadCloud className="w-4 h-4" />
+              <span>Sync XP</span>
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Error message */}
+      {error && (
+        <div className="bg-red-500/10 border border-red-500/20 rounded-2xl p-4 flex items-start gap-3">
+          <Icons.Error className="w-5 h-5 text-red-500 mt-0.5" />
+          <div>
+            <p className="text-sm font-bold text-red-500">Sync Failed</p>
+            <p className="text-xs text-red-400 mt-1">{error}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Last sync time */}
+      {lastSyncTime && !error && (
+        <div className="flex items-center gap-2 text-sm text-gray-500">
+          <Icons.Check className="w-4 h-4 text-green-500" />
+          <span>Last synced {lastSyncTime.toLocaleTimeString()}</span>
+        </div>
+      )}
+
+      {/* User rank indicator */}
+      {isUserOnBoard && userRank && (
+        <div className="bg-blue-500/5 border border-blue-500/10 rounded-2xl p-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Icons.Trophy className="w-6 h-6 text-blue-500" />
+            <div>
+              <p className="text-sm font-bold text-blue-500">Your Global Rank</p>
+              <p className="text-xs text-gray-500 mt-0.5">Out of {globalLeaderboard.length} players</p>
+            </div>
+          </div>
+          <span className="text-3xl font-bold text-blue-500">#{userRank}</span>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] p-20 text-center space-y-4">
+          <Icons.Spinner className="w-12 h-12 mx-auto text-blue-500 mb-4" />
+          <p className="text-gray-500 font-medium text-lg">Loading global leaderboard...</p>
+        </div>
+      ) : globalLeaderboard.length === 0 ? (
+        <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] p-20 text-center space-y-4">
+          <Icons.Trophy className="w-12 h-12 mx-auto text-gray-300 dark:text-white/10 mb-4" />
+          <p className="text-gray-500 font-medium text-lg">Be the first to join the global leaderboard!</p>
+          <button onClick={handleSyncXP} className="mt-4 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold">
+            Sync Your XP
+          </button>
+        </div>
+      ) : (
+        <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] overflow-hidden shadow-sm">
+          <div className="p-8 border-b border-gray-100 dark:border-white/5 grid grid-cols-[80px_1fr_120px_120px] text-[11px] font-bold uppercase tracking-[0.25em] text-gray-400 opacity-50"><span>Rank</span><span>Operator</span><span className="text-center">Tier</span><span className="text-right">Total XP</span></div>
+          <div className="divide-y divide-gray-50 dark:divide-white/5">{globalLeaderboard.map((user, index) => {
+            const isSelf = user.uid === currentUser.uid; const rankInfo = getRankContent(index); const tier = getTier(index); return (
+              <div key={user.uid} className={`grid grid-cols-[80px_1fr_120px_120px] items-center p-8 transition-colors ${isSelf ? 'bg-blue-500/[0.03] dark:bg-blue-500/[0.05]' : ''}`}>
+                <span className={`text-xl font-bold tabular-nums ${rankInfo ? rankInfo.color : 'text-gray-400'}`}>{rankInfo ? rankInfo.medal : (index + 1).toString().padStart(2, '0')}</span>
+                <div className="flex items-center gap-4"><span className={`text-lg font-bold tracking-tight ${isSelf ? 'text-gray-900 dark:text-white' : 'text-gray-500'}`}>{user.displayName}</span>{isSelf && <span className="text-[9px] font-bold uppercase tracking-widest bg-blue-500/10 text-blue-500 px-3 py-1 rounded-full">You</span>}</div>
+                <div className="justify-center flex"><span className={`text-[9px] font-bold uppercase tracking-widest px-3 py-1 rounded-full ${tier.color}`}>{tier.label}</span></div>
+                <span className={`text-xl font-bold tabular-nums text-right ${isSelf ? 'text-gray-900 dark:text-white' : 'text-gray-400'}`}>{user.xp.toLocaleString()}</span>
+              </div>
+            );
+          })}</div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const getGradeMetrics = (gradeStr: string) => {
+  const percent = parseFloat(gradeStr.replace('%', ''));
+  if (isNaN(percent)) return { letter: 'N/A', color: 'text-gray-400', bg: 'bg-gray-400/10', glow: '' };
+
+  if (percent >= 97) return { letter: 'A+', color: 'text-green-500', bg: 'bg-green-500/15', glow: 'shadow-[0_0_15px_rgba(34,197,94,0.3)]' };
+  if (percent >= 93) return { letter: 'A', color: 'text-green-400', bg: 'bg-green-400/10', glow: 'shadow-[0_0_10px_rgba(74,222,128,0.2)]' };
+  if (percent >= 90) return { letter: 'A-', color: 'text-emerald-400', bg: 'bg-emerald-400/10', glow: '' };
+  if (percent >= 87) return { letter: 'B+', color: 'text-blue-400', bg: 'bg-blue-400/10', glow: '' };
+  if (percent >= 83) return { letter: 'B', color: 'text-blue-500', bg: 'bg-blue-500/10', glow: '' };
+  if (percent >= 80) return { letter: 'B-', color: 'text-cyan-400', bg: 'bg-cyan-400/10', glow: '' };
+  if (percent >= 77) return { letter: 'C+', color: 'text-yellow-400', bg: 'bg-yellow-400/10', glow: '' };
+  if (percent >= 73) return { letter: 'C', color: 'text-yellow-500', bg: 'bg-yellow-500/10', glow: '' };
+  if (percent >= 70) return { letter: 'C-', color: 'text-amber-500', bg: 'bg-amber-500/10', glow: '' };
+  if (percent >= 67) return { letter: 'D+', color: 'text-orange-400', bg: 'bg-orange-400/10', glow: '' };
+  if (percent >= 63) return { letter: 'D', color: 'text-orange-500', bg: 'bg-orange-500/10', glow: '' };
+  return { letter: 'F', color: 'text-rose-500', bg: 'bg-rose-500/10', glow: '' };
+};
+
+const calculateStudyPriority = (assignment: Assignment, currentGrades: any[]) => {
+  let score = 0;
+
+  const weight = assignment.weight || 10;
+  score += Math.min(4.0, (weight / 20) * 4.0);
+
+  if (assignment.dueDate) {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const due = new Date(assignment.dueDate);
+    due.setHours(0, 0, 0, 0);
+    const diffDays = Math.ceil((due.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+
+    if (diffDays <= 0) score += 4.0;
+    else if (diffDays === 1) score += 3.0;
+    else if (diffDays <= 3) score += 2.0;
+    else if (diffDays <= 7) score += 1.0;
+  }
+
+  const normalizedSub = normalizeSubject(assignment.subject);
+  const gradeObj = currentGrades.find(g => normalizeSubject(g.subject || g.course) === normalizedSub);
+  if (gradeObj && gradeObj.grade) {
+    const percent = parseFloat(gradeObj.grade.replace('%', ''));
+    if (!isNaN(percent)) {
+      const jumpThresholds = [63, 67, 70, 73, 77, 80, 83, 87, 90, 93, 97];
+      const isNearEdge = jumpThresholds.some(t => percent >= t - 1.5 && percent < t);
+      if (isNearEdge) score += 2.0;
+    }
+  }
+
+  return Math.min(10.0, score).toFixed(1);
+};
+
+const GradesSection: React.FC<{ reduceMotion: boolean; activeAssignments: Assignment[] }> = ({ reduceMotion, activeAssignments }) => {
+  const [grades, setGrades] = useState<any[]>(() => {
+    const saved = localStorage.getItem('flash-grades');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [isLoading, setIsLoading] = useState(false);
+  const [gradeProgress, setGradeProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const gradesContainerRef = useRef<HTMLDivElement>(null);
+
+  const syncGrades = async () => {
+    const email = localStorage.getItem('flash-operator-email');
+    const password = localStorage.getItem('flash-operator-password');
+    if (!email || !password) {
+      setError('Offline Logic: Configure Portal Sync in Settings.');
+      playUISound('error');
+      return;
+    }
+
+    setIsLoading(true);
+    setGradeProgress(0);
+    setError(null);
+    playUISound('action');
+
+    try {
+      setGradeProgress(10);
+
+      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-grades', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+
+      setGradeProgress(50);
+
+      if (!response.ok) throw new Error('Uplink synchronization failed.');
+
+      setGradeProgress(70);
+      const result = await response.json();
+
+      setGradeProgress(85);
+      const rawText = result.data || (typeof result === 'string' ? result : JSON.stringify(result));
+      const gradesList = await parseGradesText(rawText);
+
+      setGradeProgress(100);
+      setGrades(gradesList);
+      localStorage.setItem('flash-grades', JSON.stringify(gradesList));
+      playUISound('success');
+
+      if (gradesList.length > 0) {
+        setTimeout(() => {
+          gradesContainerRef.current?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+        }, 300);
+      }
+    } catch (err: any) {
+      setError(err.message || 'Sequence protocol failure.');
+      playUISound('error');
+    } finally {
+      setTimeout(() => {
+        setIsLoading(false);
+        setGradeProgress(0);
+      }, 800);
+    }
+  };
+
+  const overallGPA = useMemo(() => {
+    if (grades.length === 0) return null;
+
+    const getGPA = (percent: number) => {
+      if (percent >= 93) return 4.0;
+      if (percent >= 90) return 3.7;
+      if (percent >= 87) return 3.3;
+      if (percent >= 83) return 3.0;
+      if (percent >= 80) return 2.7;
+      if (percent >= 77) return 2.3;
+      if (percent >= 73) return 2.0;
+      if (percent >= 70) return 1.7;
+      if (percent >= 67) return 1.3;
+      if (percent >= 63) return 1.0;
+      return 0.0;
+    };
+
+    const validGrades = grades.filter(g => !isNaN(parseFloat(g.grade?.replace('%', ''))));
+    if (validGrades.length === 0) return null;
+
+    const totalGpaPoints = validGrades.reduce((acc, g) => {
+      const percent = parseFloat(g.grade.replace('%', ''));
+      return acc + getGPA(percent);
+    }, 0);
+
+    return (totalGpaPoints / validGrades.length).toFixed(2);
+  }, [grades]);
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-16 pb-32">
+      <LoadingBar isVisible={isLoading} progress={gradeProgress} label="Grade Sync" />
+      <div>
+        <h1 className="text-6xl font-bold tracking-tighter mb-4">Grades.</h1>
+        <p className="text-gray-400 text-xl font-medium">Materialized academic performance metrics from the school vault.</p>
+      </div>
+
+      <div className="p-8 bg-amber-500/5 border border-amber-500/20 rounded-[2.5rem] flex items-start gap-6">
+        <div className="w-12 h-12 rounded-2xl bg-amber-500/10 flex items-center justify-center text-amber-500 shrink-0"><Icons.Error className="w-6 h-6" /></div>
+        <div className="space-y-1">
+          <p className="text-xs font-black uppercase tracking-widest text-amber-500">Academic Privacy Protocol</p>
+          <p className="text-sm text-amber-600/80 dark:text-amber-400/60 font-medium leading-relaxed">
+            Grade synchronization initiates a deep-link with the portal. Letter grades materialized via American standard GPA matrix.
+          </p>
+        </div>
+      </div>
+
+      <button
+        onClick={syncGrades}
+        disabled={isLoading}
+        className="w-full py-8 bg-gray-900 dark:bg-white text-white dark:text-black rounded-[3rem] font-bold uppercase tracking-[0.2em] shadow-2xl active:scale-95 transition-all text-sm flex items-center justify-center gap-3 disabled:opacity-50"
+      >
+        {isLoading ? <Icons.Spinner className="w-5 h-5" /> : <Icons.Restore className="w-5 h-5" />}
+        <span>{isLoading ? 'Synchronizing Vault...' : 'Initiate Grade Refresh'}</span>
+      </button>
+
+      {error && (
+        <div className="p-6 bg-rose-500/10 border border-rose-500/20 rounded-[2rem] text-rose-500 text-sm font-bold flex gap-4 items-center">
+          <Icons.Error className="w-5 h-5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {overallGPA && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="p-10 bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] shadow-sm flex items-center justify-between"
+        >
+          <div className="space-y-1">
+            <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-gray-400">Cumulative GPA</p>
+            <p className="text-gray-500 font-medium">Based on materialized vault data.</p>
+          </div>
+          <div className="flex items-baseline gap-3">
+            <span className="text-7xl font-black tracking-tighter text-blue-500">{overallGPA}</span>
+            <span className="text-2xl font-bold text-gray-300 dark:text-white/20">/ 4.0</span>
+          </div>
+        </motion.div>
+      )}
+
+      {grades.length > 0 && (
+        <div ref={gradesContainerRef} className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] overflow-hidden shadow-sm">
+          <div className="p-8 border-b border-gray-100 dark:border-white/5 grid grid-cols-[1fr_1fr_140px] text-[11px] font-bold uppercase tracking-[0.25em] text-gray-400 opacity-50">
+            <span>Course Protocol</span>
+            <span className="px-4">Active Objectives</span>
+            <span className="text-right">Performance</span>
+          </div>
+          <div className="divide-y divide-gray-50 dark:divide-white/5">
+            {grades.map((g, i) => {
+              const normalizedGradeSubject = normalizeSubject(g.subject || g.course || '');
+              const subjectAssignments = activeAssignments.filter(a => normalizeSubject(a.subject) === normalizedGradeSubject);
+              const metrics = getGradeMetrics(g.grade);
+              const SubjectIcon = getSubjectIcon(g.subject);
+
+              return (
+                <div key={i} className="grid grid-cols-[1fr_1fr_140px] items-center p-8 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
+                  <div className="flex items-center gap-4">
+                    <div className={`p-2 rounded-lg bg-gray-50 dark:bg-white/5 ${metrics.color}`}>
+                      <SubjectIcon className="w-5 h-5" />
+                    </div>
+                    <span className="text-lg font-bold tracking-tight uppercase truncate">{g.subject || g.course || 'Unidentified Module'}</span>
+                  </div>
+                  <div className="flex flex-col gap-2 px-4">
+                    {subjectAssignments.length > 0 ? (
+                      subjectAssignments.map(a => (
+                        <div key={a.id} className="flex items-center gap-2">
+                          <div className="w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)] shrink-0" />
+                          <span className="text-[10px] font-bold text-gray-500 uppercase tracking-tight truncate max-w-[150px]">{a.title}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <span className="text-[9px] font-bold text-gray-300 dark:text-white/10 uppercase tracking-widest">Clear</span>
+                    )}
+                  </div>
+                  <div className="flex flex-col items-end gap-1">
+                    <div className="flex items-center gap-3">
+                      <span className={`text-xs font-black px-2.5 py-1 rounded-lg ${metrics.bg} ${metrics.color} ${metrics.glow}`}>
+                        {metrics.letter}
+                      </span>
+                      <span className={`text-xl font-bold tabular-nums text-right ${metrics.color}`}>
+                        {g.grade || 'N/A'}
+                      </span>
+                    </div>
+                    <div className="w-20 h-1 bg-gray-100 dark:bg-white/5 rounded-full overflow-hidden">
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${Math.min(100, parseFloat(g.grade.replace('%', '')) || 0)}%` }}
+                        className={`h-full ${metrics.bg.replace('/10', '')}`}
+                      />
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const IntegrationsSection: React.FC<{ onOpenScraper: () => void; drive: ReturnType<typeof useGoogleDrive> }> = ({ onOpenScraper, drive }) => {
+  const integrations = [
+    { id: 'portal', name: 'Portal', desc: 'Scan and extract school homework directly from the source.', icon: Icons.School, status: 'Active', color: 'text-amber-500', active: true, onConfig: onOpenScraper },
+    { id: 'drive', name: 'Google Drive', desc: 'Attach and view reference materials directly from your Drive.', icon: Icons.FileText, status: drive.token ? 'Connected' : 'Disconnected', color: 'text-blue-500', active: !!drive.token, onConfig: drive.token ? drive.disconnect : drive.connect },
+    { id: 'notion', name: 'Notion', desc: 'Export tactical objectives to your personal workspace.', icon: Icons.Layout, status: 'Coming Soon', color: 'text-purple-500' },
+    { id: 'canvas', name: 'Canvas', desc: 'Direct ingestion of course materials and deadlines.', icon: Icons.School, status: 'Beta', color: 'text-rose-500' },
+    { id: 'discord', name: 'Discord', desc: 'Real-time notifications for upcoming objective deadlines.', icon: Icons.Send, status: 'Coming Soon', color: 'text-indigo-500' }
+  ];
+  return (
+    <div className="max-w-4xl mx-auto space-y-16 pb-32">
+      <div><h1 className="text-6xl font-bold tracking-tighter mb-4">Integrations.</h1><p className="text-gray-400 text-xl font-medium">Connect Flash to your external academic ecosystems.</p></div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">{integrations.map((int) => (
+        <div key={int.id} className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] p-10 flex flex-col justify-between group hover:border-blue-500/20 transition-all">
+          <div className="space-y-6">
+            <div className={`w-14 h-14 rounded-2xl flex items-center justify-center bg-gray-50 dark:bg-white/5 ${int.color}`}><int.icon className="w-7 h-7" /></div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-3"><h3 className="text-2xl font-bold tracking-tight">{int.name}</h3>{int.active && <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />}</div>
+              <p className="text-sm text-gray-500 font-medium leading-relaxed">{int.desc}</p>
+            </div>
+          </div>
+          <div className="mt-10 pt-6 border-t border-gray-100 dark:border-white/5 flex items-center justify-between"><span className={`text-[10px] font-bold uppercase tracking-widest ${int.active ? 'text-green-500' : 'text-gray-400'}`}>{int.status}</span><button onClick={int.onConfig} disabled={!int.onConfig && int.status !== 'Active'} className={`text-[10px] font-bold uppercase tracking-widest transition-all ${int.onConfig ? 'text-blue-500 hover:text-blue-400' : 'text-blue-500 opacity-40 cursor-not-allowed'}`}>{int.active ? (int.id === 'drive' ? 'Disconnect' : 'Manage') : 'Configure'}</button></div>
+        </div>
+      ))}</div>
+
+      {/* File Upload System */}
+      <div className="mt-16">
+        <div className="mb-8">
+          <h2 className="text-4xl font-bold tracking-tighter mb-2">Document Upload.</h2>
+          <p className="text-gray-400 text-lg font-medium">Securely upload .doc and .docx files to Supabase Storage.</p>
+        </div>
+        <FileUpload
+          userId={auth.currentUser?.uid || 'anonymous'}
+          onUploadSuccess={(file) => {
+            console.log('Upload successful:', file);
+            playUISound('success');
+          }}
+          onUploadError={(error) => {
+            console.error('Upload error:', error);
+            playUISound('error');
+          }}
+        />
+      </div>
+    </div>
+  );
+};
+
+// --- Date Helper Functions ---
+const isDateInPast = (dateStr?: string): boolean => {
+  if (!dateStr) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const date = new Date(dateStr);
+  return date < today;
+};
+
+const isDateToday = (dateStr?: string): boolean => {
+  if (!dateStr) return false;
+  const today = new Date();
+  const date = new Date(dateStr);
+  return date.toDateString() === today.toDateString();
+};
+
+const isDateTomorrow = (dateStr?: string): boolean => {
+  if (!dateStr) return false;
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const date = new Date(dateStr);
+  return date.toDateString() === tomorrow.toDateString();
+};
+
+// --- Objective Parsing and Display ---
+interface ParsedObjective {
+  title: string;
+  subject: string;
+  dueDate: string;
+  weight: string;
+  currentGrade: string;
+  requiredScore: string;
+  strategy: string;
+}
+
+const parseObjectivesFromText = (text: string, allAssignments: Assignment[]): ParsedObjective[] => {
+  const objectives: ParsedObjective[] = [];
+
+  // Split by OBJECTIVE markers
+  const objectiveBlocks = text.split(/(?=OBJECTIVE \d+:)/gi);
+
+  for (const block of objectiveBlocks) {
+    if (!block.trim() || !block.match(/OBJECTIVE \d+:/i)) continue;
+
+    const titleMatch = block.match(/OBJECTIVE \d+:\s*(.+?)(?:\n|$)/i);
+    const dueMatch = block.match(/DUE:\s*(.+?)(?:\n|$)/i);
+    const weightMatch = block.match(/WEIGHT:\s*(.+?)(?:\n|$)/i);
+    const currentGradeMatch = block.match(/CURRENT GRADE:\s*(.+?)(?:\n|$)/i);
+    const requiredScoreMatch = block.match(/REQUIRED SCORE FOR A:\s*(.+?)(?:\n|$)/i);
+    const strategyMatch = block.match(/HIGH YIELD STRATEGY:\s*(.+?)(?=\n\nOBJECTIVE|\n\nQuery|$)/is);
+
+    if (titleMatch) {
+      const title = titleMatch[1].trim();
+
+      // Try to match assignment by title to get subject
+      let subject = 'GENERAL';
+      const matchingAssignment = allAssignments.find(a =>
+        title.toLowerCase().includes(a.title.toLowerCase()) ||
+        a.title.toLowerCase().includes(title.toLowerCase())
+      );
+      if (matchingAssignment) {
+        subject = matchingAssignment.subject;
+      } else {
+        // Try to infer from title keywords
+        const titleLower = title.toLowerCase();
+        if (titleLower.includes('math') || titleLower.includes('algebra') || titleLower.includes('geometry')) subject = 'MATH';
+        else if (titleLower.includes('english') || titleLower.includes('literature') || titleLower.includes('writing')) subject = 'ENGLISH';
+        else if (titleLower.includes('biology') || titleLower.includes('science')) subject = 'BIOLOGY';
+        else if (titleLower.includes('history') || titleLower.includes('social')) subject = 'SOCIAL STUDIES';
+        else if (titleLower.includes('arabic') || titleLower.includes('religion') || titleLower.includes('islamic')) subject = 'ARABIC';
+      }
+
+      objectives.push({
+        title: title,
+        subject: subject,
+        dueDate: dueMatch ? dueMatch[1].trim() : 'No due date',
+        weight: weightMatch ? weightMatch[1].trim() : 'Not specified',
+        currentGrade: currentGradeMatch ? currentGradeMatch[1].trim() : 'N/A',
+        requiredScore: requiredScoreMatch ? requiredScoreMatch[1].trim() : 'N/A',
+        strategy: strategyMatch ? strategyMatch[1].trim() : 'No strategy provided.',
+      });
+    }
+  }
+
+  return objectives;
+};
+
+const ObjectiveCard: React.FC<{ objective: ParsedObjective; reduceMotion: boolean }> = ({ objective, reduceMotion }) => {
+  const SubjectIcon = getSubjectIcon(objective.subject);
+
+  // Determine subject color
+  const subjectColors: Record<string, { bg: string; text: string; border: string; badge: string }> = {
+    MATH: { bg: 'bg-blue-500/10', text: 'text-blue-500', border: 'border-blue-500/20', badge: 'bg-blue-500' },
+    ENGLISH: { bg: 'bg-amber-500/10', text: 'text-amber-500', border: 'border-amber-500/20', badge: 'bg-amber-500' },
+    BIOLOGY: { bg: 'bg-emerald-500/10', text: 'text-emerald-500', border: 'border-emerald-500/20', badge: 'bg-emerald-500' },
+    'SOCIAL STUDIES': { bg: 'bg-purple-500/10', text: 'text-purple-500', border: 'border-purple-500/20', badge: 'bg-purple-500' },
+    ARABIC: { bg: 'bg-red-500/10', text: 'text-red-500', border: 'border-red-500/20', badge: 'bg-red-500' },
+    GENERAL: { bg: 'bg-gray-500/10', text: 'text-gray-500', border: 'border-gray-500/20', badge: 'bg-gray-500' },
+  };
+  const colors = subjectColors[objective.subject] || subjectColors.GENERAL;
+
+  // Determine urgency
+  const isUrgent = isDateToday(objective.dueDate);
+  const isSoon = isDateTomorrow(objective.dueDate);
+
+  // Parse grades for progress bar
+  const currentGradeNum = parseFloat(objective.currentGrade) || 0;
+  const requiredScoreNum = parseFloat(objective.requiredScore.replace(/[^\d.]/g, '')) || 0;
+  const gradeStatus = currentGradeNum >= requiredScoreNum ? 'safe' : currentGradeNum >= requiredScoreNum - 5 ? 'maintain' : 'urgent';
+  const progressBarColor = gradeStatus === 'safe' ? 'bg-emerald-500' : gradeStatus === 'maintain' ? 'bg-amber-500' : 'bg-rose-500';
+
+  return (
+    <motion.div
+      initial={reduceMotion ? {} : { opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`p-6 rounded-3xl border ${colors.border} ${colors.bg} backdrop-blur-sm space-y-4`}
+    >
+      {/* Header: Subject Badge + Title */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-3">
+          <div className={`w-10 h-10 rounded-2xl ${colors.badge} flex items-center justify-center shrink-0`}>
+            <SubjectIcon className="w-5 h-5 text-white" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className={`text-xs font-black uppercase tracking-widest ${colors.text}`}>{objective.subject}</p>
+          </div>
+          {isUrgent && (
+            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-rose-500/20 border border-rose-500/30">
+              <div className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
+              <span className="text-xs font-bold text-rose-500 uppercase tracking-wider">Due Today</span>
+            </div>
+          )}
+          {!isUrgent && isSoon && (
+            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/20 border border-amber-500/30">
+              <div className="w-2 h-2 rounded-full bg-amber-500" />
+              <span className="text-xs font-bold text-amber-500 uppercase tracking-wider">Tomorrow</span>
+            </div>
+          )}
+        </div>
+        <h3 className="text-lg font-bold tracking-tight leading-snug">{objective.title}</h3>
+      </div>
+
+      {/* Due Date & Weight */}
+      <div className="flex flex-wrap gap-3">
+        <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-white/5 border border-white/10">
+          <Icons.Calendar className="w-4 h-4 text-gray-400" />
+          <span className="text-sm font-medium text-gray-300">{objective.dueDate}</span>
+        </div>
+        <div className="flex items-center gap-2 px-4 py-2 rounded-2xl bg-white/5 border border-white/10">
+          <Icons.Percent className="w-4 h-4 text-gray-400" />
+          <span className="text-sm font-medium text-gray-300">{objective.weight}</span>
+        </div>
+      </div>
+
+      {/* Grade Progress */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between text-sm">
+          <span className="font-medium text-gray-400">Current Grade</span>
+          <span className="font-bold">{objective.currentGrade}</span>
+        </div>
+        <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+          <div
+            className={`h-full ${progressBarColor} transition-all duration-500`}
+            style={{ width: `${Math.min(currentGradeNum, 100)}%` }}
+          />
+        </div>
+        <div className="flex items-center justify-between text-sm">
+          <span className="font-medium text-gray-400">Required for A</span>
+          <span className={`font-bold ${gradeStatus === 'safe' ? 'text-emerald-500' : gradeStatus === 'maintain' ? 'text-amber-500' : 'text-rose-500'}`}>
+            {objective.requiredScore}
+          </span>
+        </div>
+      </div>
+
+      {/* Strategy */}
+      <div className="pt-3 border-t border-white/5 space-y-2">
+        <div className="flex items-center gap-2">
+          <Icons.Lightbulb className={`w-4 h-4 ${colors.text}`} />
+          <span className={`text-xs font-black uppercase tracking-widest ${colors.text}`}>Strategy</span>
+        </div>
+        <p className="text-sm leading-relaxed text-gray-300">{objective.strategy}</p>
+      </div>
+    </motion.div>
+  );
+}
+
+const getGradeImpact = (assignment: Assignment) => {
+  const getCategoryFromAssignment = (assignment: Assignment): (keyof typeof WEIGHTS) | null => {
+    const title = assignment.title || '';
+    if (title.includes('CW')) return 'classwork';
+    if (title.includes('HW')) return 'homework';
+    if (title.includes('QZ')) return 'quizzes';
+    if (title.includes('PART')) return 'participation';
+    if (title.includes('EXAM') || title.includes('Final')) return 'finalExam';
+    const lowerTitle = title.toLowerCase();
+    if (lowerTitle.includes('classwork')) return 'classwork';
+    if (lowerTitle.includes('homework')) return 'homework';
+    if (lowerTitle.includes('quiz')) return 'quizzes';
+    if (lowerTitle.includes('participation')) return 'participation';
+    if (lowerTitle.includes('final exam')) return 'finalExam';
+    return null;
+  }
+  const category = getCategoryFromAssignment(assignment);
+  if (!category || !WEIGHTS[category] || !DEFAULT_COUNTS[category]) return null;
+  const weight = WEIGHTS[category];
+  const totalItems = DEFAULT_COUNTS[category];
+  const impact = (weight / totalItems) * 100;
+  return impact.toFixed(1);
+};
+
+const StatsHeader: React.FC<{ assignments: Assignment[]; grades: any[] }> = ({ assignments, grades }) => {
+  const { overdueCount, dueTodayCount, activeCount, gpa, streaks, termSummary } = useMemo(() => {
+    const active = assignments.filter(a => !a.isCompleted);
+    const overdue = active.filter(a => a.dueDate && isDateInPast(a.dueDate)).length;
+    const dueToday = active.filter(a => a.dueDate && isDateToday(a.dueDate)).length;
+
+    let gpaValue = 'N/A';
+    const numericGrades = grades.map(g => {
+      const gradeVal = parseFloat(g.grade);
+      return { subject: g.subject, grade: isNaN(gradeVal) ? null : gradeVal };
+    }).filter(g => g.grade !== null) as { subject: string; grade: number }[];
+
+    if (numericGrades.length > 0) {
+      const getGPA = (percent: number) => {
+        if (percent >= 93) return 4.0; if (percent >= 90) return 3.7; if (percent >= 87) return 3.3; if (percent >= 83) return 3.0; if (percent >= 80) return 2.7; if (percent >= 77) return 2.3; if (percent >= 73) return 2.0; if (percent >= 70) return 1.7; if (percent >= 67) return 1.3; if (percent >= 63) return 1.0; return 0.0;
+      };
+      const totalGpaPoints = numericGrades.reduce((acc, g) => acc + getGPA(g.grade), 0);
+      gpaValue = (totalGpaPoints / numericGrades.length).toFixed(2);
+    }
+
+    const history = assignments.filter(a => a.isCompleted).sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0));
+    let currentStreak = 0, bestStreak = 0, lateCount = 0;
+
+    if (history.length > 0) {
+      const reversedHistory = [...history].reverse();
+      for (const item of reversedHistory) {
+        if (item.completedAt && item.dueDate && item.completedAt <= new Date(item.dueDate).getTime() + 86400000) { currentStreak++; } else { break; }
+      }
+      let localCurrentStreak = 0;
+      history.forEach(item => {
+        if (item.completedAt && item.dueDate) {
+          if (item.completedAt <= new Date(item.dueDate).getTime() + 86400000) { localCurrentStreak++; } else { lateCount++; bestStreak = Math.max(bestStreak, localCurrentStreak); localCurrentStreak = 0; }
+        }
+      });
+      bestStreak = Math.max(bestStreak, localCurrentStreak);
+    }
+    const lateRate = history.length > 0 ? ((lateCount / history.length) * 100).toFixed(0) : '0';
+
+    const avgScore = numericGrades.length > 0
+      ? (numericGrades.reduce((acc, g) => acc + g.grade, 0) / numericGrades.length).toFixed(1)
+      : 'N/A';
+    const sortedGrades = [...numericGrades].sort((a, b) => b.grade - a.grade);
+    const strongest = sortedGrades.length > 0 ? sortedGrades[0].subject : 'N/A';
+    const weakest = sortedGrades.length > 0 ? sortedGrades[sortedGrades.length - 1].subject : 'N/A';
+
+    return {
+      overdueCount: overdue,
+      dueTodayCount: dueToday,
+      activeCount: active.length,
+      gpa: gpaValue,
+      streaks: { currentStreak, bestStreak, lateRate },
+      termSummary: { avgScore, strongest, weakest }
+    };
+  }, [assignments, grades]);
+
+  const PrimaryStatCard: React.FC<{ label: string, value: string | number, color?: string }> = ({ label, value, color }) => (
+    <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[2.5rem] p-8 space-y-2 shadow-sm">
+      <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400">{label}</p>
+      <p className={`text-5xl font-bold tracking-tighter ${color || 'text-gray-900 dark:text-white'}`}>{value}</p>
+    </div>
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+        <PrimaryStatCard label="Active Signals" value={activeCount} />
+        <PrimaryStatCard label="Due Today" value={dueTodayCount} color="text-amber-500" />
+        <PrimaryStatCard label="Overdue" value={overdueCount} color="text-rose-500" />
+        <PrimaryStatCard label="Cumulative GPA" value={gpa} color="text-blue-500" />
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[2.5rem] p-8 space-y-6 shadow-sm">
+          <div className="flex items-center gap-3">
+            <Icons.Flame className="w-5 h-5 text-amber-500" />
+            <h3 className="font-bold text-gray-900 dark:text-white uppercase tracking-widest text-sm">Productivity</h3>
+          </div>
+          <div className="grid grid-cols-3 gap-4 text-center pt-2">
+            <div>
+              <p className="text-4xl font-bold tracking-tighter text-amber-500">{streaks.currentStreak}</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mt-1">On-Time Streak</p>
+            </div>
+            <div>
+              <p className="text-4xl font-bold tracking-tighter text-green-500">{streaks.bestStreak}</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mt-1">Best Streak</p>
+            </div>
+            <div>
+              <p className="text-4xl font-bold tracking-tighter text-rose-500">{streaks.lateRate}<span className="text-xl opacity-50">%</span></p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mt-1">Late Rate</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[2.5rem] p-8 space-y-6 shadow-sm">
+          <div className="flex items-center gap-3">
+            <Icons.BarChart className="w-5 h-5 text-blue-500" />
+            <h3 className="font-bold text-gray-900 dark:text-white uppercase tracking-widest text-sm">Term Summary</h3>
+          </div>
+          <div className="grid grid-cols-2 gap-4 pt-2">
+            <div className="text-center">
+              <p className="text-4xl font-bold tracking-tighter text-blue-500">{termSummary.avgScore}<span className="text-xl opacity-50">{termSummary.avgScore !== 'N/A' ? '%' : ''}</span></p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mt-1">Avg. Score</p>
+            </div>
+            <div className="flex flex-col items-start justify-center space-y-3 pl-4 border-l border-gray-100 dark:border-white/5">
+              <div className="flex items-center gap-3 min-w-0">
+                <Icons.TrendingUp className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Strongest:</span>
+                <span className="text-sm font-bold text-emerald-500 uppercase truncate">{termSummary.strongest}</span>
+              </div>
+              <div className="flex items-center gap-3 min-w-0">
+                <Icons.TrendingDown className="w-4 h-4 text-orange-500 shrink-0" />
+                <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Weakest:</span>
+                <span className="text-sm font-bold text-orange-500 uppercase truncate">{termSummary.weakest}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const AssignmentList: React.FC<{ assignments: Assignment[], isHistory?: boolean }> = ({ assignments, isHistory }) => {
+  const getStatus = (a: Assignment) => {
+    if (a.isCompleted) return { label: 'Complete', color: 'bg-green-500/10 text-green-500' };
+    if (a.dueDate && isDateInPast(a.dueDate)) return { label: 'Overdue', color: 'bg-rose-500/10 text-rose-500' };
+    if (a.dueDate && isDateToday(a.dueDate)) return { label: 'Due Today', color: 'bg-amber-500/10 text-amber-500' };
+    return { label: 'Upcoming', color: 'bg-gray-500/10 text-gray-500' };
+  }
+
+  return (
+    <div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] overflow-hidden shadow-sm">
+      <div className="p-6 border-b border-gray-100 dark:border-white/5 grid grid-cols-[2fr_1fr_1fr_1fr_1fr] gap-4 text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 opacity-50">
+        <span>Objective</span>
+        <span className="text-center">Subject</span>
+        <span className="text-center">Impact</span>
+        <span className="text-center">Date</span>
+        <span className="text-right">Status</span>
+      </div>
+      <div className="divide-y divide-gray-50 dark:divide-white/5">
+        {assignments.map(a => {
+          const status = getStatus(a);
+          const impact = getGradeImpact(a);
+          return (
+            <div key={a.id} className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr] items-center p-5 gap-4 hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
+              <span className={`font-bold tracking-tight truncate ${isHistory ? 'line-through opacity-50' : ''}`}>{a.title}</span>
+              <div className="flex justify-center"><span className="text-[9px] font-bold uppercase tracking-widest bg-blue-500/10 text-blue-500 px-3 py-1 rounded-full truncate">{a.subject}</span></div>
+              <span className="font-bold tabular-nums text-center text-sm text-green-500">{impact ? `+${impact}%` : 'N/A'}</span>
+              <span className="font-bold tabular-nums text-center text-sm text-gray-500">{a.dueDate ? new Date(a.dueDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'N/A'}</span>
+              <div className="flex justify-end"><span className={`text-[9px] font-bold uppercase tracking-widest px-3 py-1 rounded-full ${status.color}`}>{status.label}</span></div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  );
+};
+
+const AssignmentCard: React.FC<{ assignment: Assignment; settings: AppSettings; currentGrades: any[]; onRemove: () => void; onComplete?: () => void; onRestore?: () => void; onSelect?: () => void; onFirstSubmit?: () => void; onPortalSubmit?: (a: Assignment) => void; onEdit?: () => void; isHistory?: boolean; reduceMotion?: boolean; }> = ({ assignment, settings, currentGrades, onRemove, onComplete, onRestore, onSelect, onFirstSubmit, onPortalSubmit, onEdit, isHistory, reduceMotion }) => {
+  const [isRedirecting, setIsRedirecting] = useState(false); const [isHovered, setIsHovered] = useState(false);
+  const urgency = useMemo(() => {
+    if (!assignment.dueDate || isHistory) return null;
+    if (isDateInPast(assignment.dueDate)) {
+      return { color: 'bg-rose-500', glow: 'shadow-[0_0_12px_rgba(244,63,94,0.6)]', label: 'OVERDUE', type: 'overdue' };
+    }
+    const now = new Date(); now.setHours(0, 0, 0, 0);
+    const due = new Date(assignment.dueDate); due.setHours(0, 0, 0, 0);
+    const diffDays = Math.ceil((due.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    if (diffDays === 0) return { color: 'bg-rose-500', glow: 'shadow-[0_0_12px_rgba(244,63,94,0.6)]', label: 'DUE TODAY', type: 'today' };
+    if (diffDays === 1) return { color: 'bg-amber-500', glow: 'shadow-[0_0_12px_rgba(245,158,11,0.6)]', label: 'DUE TOMORROW', type: 'tomorrow' };
+    return null;
+  }, [assignment.dueDate, isHistory]);
+
+  const SubjectIcon = getSubjectIcon(assignment.subject);
+
+  const studyPriority = useMemo(() => {
+    if (isHistory) return "0.0";
+    return calculateStudyPriority(assignment, currentGrades);
+  }, [assignment, currentGrades, isHistory]);
+
+  const priorityMeta = useMemo(() => {
+    const val = parseFloat(studyPriority);
+    if (val >= 8) return { color: 'text-rose-500', bg: 'bg-rose-500/10' };
+    if (val >= 5) return { color: 'text-amber-500', bg: 'bg-amber-500/10' };
+    return { color: 'text-gray-400', bg: 'bg-gray-400/10' };
+  }, [studyPriority]);
+
+  const gradeImpact = useMemo(() => {
+    return getGradeImpact(assignment);
+  }, [assignment.title]);
+
+  const handlePortalAction = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isHistory) return;
+    if (onPortalSubmit) {
+      onPortalSubmit(assignment);
+    }
+  };
+
+  const isLocked = settings.lockAfterSubmission && isHistory; const paddingClass = settings.cardSize === 'compact' ? 'p-10' : 'p-14'; const minHeightClass = settings.cardSize === 'compact' ? 'min-h-[300px]' : 'min-h-[400px]'; const spacingClass = settings.cardSize === 'compact' ? 'space-y-6' : 'space-y-10';
+  return (
+    <>
+      <motion.div layout={!reduceMotion} initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} onMouseEnter={() => setIsHovered(true)} onMouseLeave={() => setIsHovered(false)} className={`group relative bg-white dark:bg-[#0d0d0d] border border-gray-100 dark:border-white/5 rounded-[4rem] ${paddingClass} transition-all hover:shadow-[0_40px_80px_-20px_rgba(0,0,0,0.1)] dark:hover:shadow-[0_40px_80px_-20px_rgba(0,0,0,0.4)] hover:border-blue-500/20 ${minHeightClass} flex flex-col justify-between ${isHistory ? 'opacity-60 grayscale-[0.2]' : ''}`}>
+        <div className={spacingClass}>
+          <div className="flex items-start justify-between">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2 text-blue-600 dark:text-blue-400 bg-blue-500/10 px-5 py-2 rounded-full">
+                <SubjectIcon className="w-3.5 h-3.5" />
+                <span className="text-[11px] font-black uppercase tracking-[0.25em]">{assignment.subject}</span>
+              </div>
+              {!isHistory && (
+                <div className={`flex items-center gap-2 px-4 py-1.5 rounded-full ${priorityMeta.bg}`}>
+                  <Icons.Flash className={`w-3 h-3 ${priorityMeta.color}`} />
+                  <span className={`text-[9px] font-black uppercase tracking-widest ${priorityMeta.color}`}>Priority: {studyPriority}</span>
+                </div>
+              )}
+              {!isHistory && gradeImpact && (
+                <div className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-green-500/10">
+                  <Icons.Percent className="w-3 h-3 text-green-500" />
+                  <span className="text-[9px] font-black uppercase tracking-widest text-green-500">+{gradeImpact}% Impact</span>
+                </div>
+              )}
+            </div>
+            <div className="flex gap-3 opacity-0 group-hover:opacity-100 transition-all duration-300">{onEdit && <button onClick={(e) => { e.stopPropagation(); onEdit(); }} className="p-4 bg-gray-50 dark:bg-white/5 hover:bg-blue-500/20 hover:text-blue-500 rounded-2xl transition-all"><Icons.Edit className="w-5 h-5" /></button>}{onRestore && <button onClick={(e) => { e.stopPropagation(); onRestore(); }} className="p-4 bg-gray-50 dark:bg-white/5 hover:bg-blue-500/20 hover:text-blue-500 rounded-2xl transition-all"><Icons.Restore className="w-5 h-5" /></button>}{!isHistory && onComplete && <button onClick={(e) => { e.stopPropagation(); onComplete(); }} className="p-4 bg-gray-50 dark:bg-white/5 hover:bg-green-500/20 hover:text-green-500 rounded-2xl transition-all"><Icons.Check className="w-5 h-5" /></button>}<button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="p-4 bg-gray-50 dark:bg-white/5 hover:bg-rose-500/20 hover:text-rose-500 rounded-2xl transition-all"><Icons.Trash className="w-5 h-5" /></button></div>
+          </div>
+          <div className="space-y-4"><div className="flex flex-col gap-4">{urgency && <div className="flex items-center gap-2 h-6"><div className={`w-2.5 h-2.5 rounded-full shrink-0 ${urgency.color} ${urgency.glow} animate-pulse`} /><AnimatePresence>{isHovered && <motion.span initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} className={`text-[10px] font-black uppercase tracking-[0.25em] ${urgency.color.replace('bg-', 'text-')}`}>{urgency.label}</motion.span>}</AnimatePresence></div>}<h3 className={`text-[2rem] font-bold tracking-tighter leading-[1.1] line-clamp-3 ${isHistory ? 'line-through opacity-50' : ''}`}>{assignment.title}</h3></div>{assignment.dueDate && <div className="flex items-center gap-2 text-gray-400 text-sm font-bold opacity-60"><Icons.Calendar className="w-4 h-4" /><span className="tracking-wide">{getRelativeDueDate(assignment.dueDate)}</span></div>}</div>{settings.showChecklist && !isHistory && <div className="pt-6 space-y-3 border-t border-gray-100 dark:border-white/5"><p className="text-[9px] font-bold uppercase tracking-widest text-gray-400 mb-2">Submission Checklist</p>{['AI Accuracy Reviewed', 'Formatting Applied', 'Citations Verified'].map(item => <div key={item} className="flex items-center gap-3"><div className="w-4 h-4 rounded-md border border-gray-200 dark:border-white/10 flex items-center justify-center"><Icons.Check className="w-2.5 h-2.5 text-blue-500 opacity-20" /></div><span className="text-xs font-medium text-gray-500">{item}</span></div>)}</div>}</div>
+        <div className="pt-10 space-y-4">
+          {!isHistory && settings.suggestPulseDueToday && urgency?.type === 'today' && <button onClick={(e) => { e.stopPropagation(); onSelect?.(); }} className="w-full py-3 bg-blue-500/5 hover:bg-blue-500/10 text-blue-500 border border-blue-500/20 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2"><Icons.Sparkles className="w-3 h-3" /><span>Need help? Ask Pulse</span></button>}
+          {!isHistory ? (
+            <div className="flex gap-4">
+              <button onClick={handlePortalAction} className="flex-1 py-6 bg-gray-900 dark:bg-white text-white dark:text-black rounded-[2rem] text-xs font-black uppercase tracking-[0.25em] hover:opacity-90 active:scale-[0.98] transition-all shadow-xl dark:shadow-white/5 flex items-center justify-center gap-3"><Icons.Link className="w-4 h-4" /><span>{isRedirecting ? 'Redirecting...' : 'Submit Portal'}</span></button>
+              {onSelect && <button onClick={(e) => { e.stopPropagation(); onSelect(); }} aria-label="Pulse AI" className="w-20 py-6 bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 hover:border-blue-500/40 text-gray-900 dark:text-white rounded-[2rem] transition-all flex items-center justify-center shrink-0"><Icons.Activity className="w-5 h-5 text-blue-500" /></button>}
+            </div>
+          ) : isLocked ? (
+            <div className="w-full py-6 bg-gray-100 dark:bg-white/5 rounded-[2rem] text-[10px] font-black uppercase tracking-[0.25em] text-gray-400 flex items-center justify-center gap-3 border border-transparent dark:border-white/5"><Icons.Lock className="w-4 h-4" /><span>Submission Locked</span></div>
+          ) : gradeImpact ? (
+            <div className="w-full py-5 bg-green-500/5 text-green-500 rounded-[2rem] text-xs font-bold uppercase tracking-[0.2em] flex items-center justify-center gap-3 border border-green-500/10">
+              <Icons.Percent className="w-4 h-4" />
+              <span>Impact: +{gradeImpact}% to Subject Grade</span>
+            </div>
+          ) : null}
+        </div>
+      </motion.div>
+    </>
+  );
+};
+
+const SettingsGroup: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (<div className="space-y-6"><label className="text-[11px] uppercase font-bold tracking-[0.25em] text-gray-400 opacity-50 ml-4">{title}</label><div className="bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-[3rem] shadow-sm">{children}</div></div>);
+const SettingsRow: React.FC<{ label: string; description?: string; children: React.ReactNode; last?: boolean }> = ({ label, description, children, last }) => (<div className={`flex items-center justify-between p-10 ${!last ? 'border-b border-gray-100 dark:border-white/5' : ''}`}><div className="space-y-1"><p className="text-base font-bold text-gray-900 dark:text-white">{label}</p>{description && <p className="text-sm text-gray-500 font-medium">{description}</p>}</div>{children}</div>);
+
+const Toggle: React.FC<{ enabled: boolean; onToggle: () => void }> = ({ enabled, onToggle }) => {
+  return (
+    <div
+      onClick={() => { playUISound('action'); onToggle(); }}
+      className={`w-12 h-7 flex items-center rounded-full p-1 cursor-pointer transition-colors ${enabled ? 'bg-blue-600 justify-end' : 'bg-gray-200 dark:bg-white/10 justify-start'}`}
+    >
+      <motion.div
+        layout
+        transition={{ type: "spring", stiffness: 700, damping: 30 }}
+        className="w-5 h-5 bg-white rounded-full"
+      />
+    </div>
+  );
+};
+
+const SegmentedControl: React.FC<{ options: { value: string; label: string }[]; active: string; onChange: (v: any) => void }> = ({ options, active, onChange }) => (<div className="flex bg-gray-100 dark:bg-white/5 p-1.5 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm">{options.map((opt) => (<button key={opt.value} onClick={() => { playUISound('switch'); onChange(opt.value); }} className={`px-5 py-2 rounded-xl text-xs font-bold transition-all ${active === opt.value ? 'bg-white dark:bg-white/10 shadow-md text-gray-900 dark:text-white' : 'text-gray-400'}`}>{opt.label}</button>))}</div>);
+
+const SettingsSection: React.FC<{ settings: AppSettings; onUpdate: (key: keyof AppSettings, value: any) => void; onClearAll: () => void; onSignOut: () => void; onRestartTour: () => void; }> = ({ settings, onUpdate, onClearAll, onSignOut, onRestartTour }) => {
+  const [portalEmail, setPortalEmail] = useState(() => localStorage.getItem('flash-operator-email') || '');
+  const [portalPassword, setPortalPassword] = useState(() => localStorage.getItem('flash-operator-password') || '');
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+
+  const handlePortalSave = (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaveStatus('saving');
+    playUISound('action');
+    localStorage.setItem('flash-operator-email', portalEmail);
+    localStorage.setItem('flash-operator-password', portalPassword);
+    setTimeout(() => {
+      setSaveStatus('saved');
+      playUISound('success');
+      setTimeout(() => setSaveStatus('idle'), 2000);
+    }, 600);
+  };
+
+  const isConfigured = portalEmail && portalPassword;
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-16 pb-32">
+      <div><h1 className="text-6xl font-bold tracking-tighter mb-4">Settings.</h1><p className="text-gray-400 text-xl font-medium">Fine-tune the Flash interface for maximum performance.</p></div>
+
+      <SettingsGroup title="Portal Sync Protocol">
+        <div id="tour-settings-bridge" className={`p-10 space-y-8 border-b transition-colors duration-500 ${isConfigured ? 'bg-blue-500/5 border-blue-500/10' : 'bg-rose-500/[0.03] border-rose-500/20'}`}>
+          <div className="flex items-start justify-between">
+            <div className="flex items-start gap-5">
+              <Icons.Bolt className={`w-6 h-6 shrink-0 mt-1 ${isConfigured ? 'text-blue-500' : 'text-rose-500'}`} />
+              <div className="space-y-1">
+                <p className="text-base font-bold text-gray-900 dark:text-white">Automation Bridge</p>
+                <p className="text-sm text-gray-500 font-medium">Save your PlusPortals credentials to enable automated Tactical Refresh and BOT Submissions.</p>
+              </div>
+            </div>
+            <div className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase tracking-[0.2em] border ${isConfigured ? 'bg-green-500/10 text-green-500 border-green-500/20' : 'bg-rose-500/10 text-rose-500 border-rose-500/20 animate-pulse'}`}>
+              {isConfigured ? 'Active' : 'Setup Required'}
+            </div>
+          </div>
+
+          <form onSubmit={handlePortalSave} className="space-y-8">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Email</label>
+                <input
+                  type="email"
+                  value={portalEmail}
+                  onChange={e => setPortalEmail(e.target.value)}
+                  placeholder="operator@school.edu"
+                  className={`w-full bg-white dark:bg-white/5 border p-5 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-sm font-medium transition-all ${!portalEmail && !isConfigured ? 'border-rose-500/30' : 'border-gray-200 dark:border-white/10'}`}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 ml-4">Portal Password</label>
+                <input
+                  type="password"
+                  value={portalPassword}
+                  onChange={e => setPortalPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className={`w-full bg-white dark:bg-white/5 border p-5 rounded-2xl outline-none focus:ring-1 focus:ring-blue-500/30 text-sm font-medium transition-all ${!portalPassword && !isConfigured ? 'border-rose-500/30' : 'border-gray-200 dark:border-white/10'}`}
+                />
+              </div>
+            </div>
+            <button
+              type="submit"
+              disabled={saveStatus === 'saving'}
+              className={`w-full py-5 rounded-2xl font-bold uppercase tracking-[0.2em] text-xs transition-all flex items-center justify-center gap-3 ${saveStatus === 'saved' ? 'bg-green-600 text-white' : 'bg-blue-600 text-white hover:bg-blue-500 shadow-xl shadow-blue-500/20'}`}
+            >
+              {saveStatus === 'saving' ? <Icons.Spinner className="w-4 h-4" /> : saveStatus === 'saved' ? <Icons.Check className="w-4 h-4" /> : <Icons.Restore className="w-4 h-4" />}
+              <span>{saveStatus === 'saving' ? 'Synchronizing...' : saveStatus === 'saved' ? 'Sync Successful' : 'Sync & Save Credentials'}</span>
+            </button>
+          </form>
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup title="Behavior Matrix">
+        <SettingsRow label="Current Class Deployment" description="Update your active school section to adjust schedules.">
+          <SegmentedControl active={settings.selectedClass || '10A'} onChange={(v) => onUpdate('selectedClass', v)} options={[{ value: '10A', label: '10A' }, { value: '10B', label: '10B' }, { value: '10C', label: '10C' }, { value: '10D', label: '10D' }]} />
+        </SettingsRow>
+        <SettingsRow label="Default Pulse Strategy" description="Scholar (Honest learning) or Cheat (Atomic completion)."><SegmentedControl active={settings.defaultPulseStrategy} onChange={(v) => onUpdate('defaultPulseStrategy', v)} options={[{ value: 'scholar', label: 'Scholar' }, { value: 'cheat', label: 'Cheat' }]} /></SettingsRow>
+        <SettingsRow label="Default Intel Protocol" description="Fast (Low-latency) or Think (Deep reasoning)."><SegmentedControl active={settings.defaultPulseIntelligence} onChange={(v) => onUpdate('defaultPulseIntelligence', v)} options={[{ value: 'fast', label: 'Fast' }, { value: 'think', label: 'Think' }]} /></SettingsRow>
+        <SettingsRow label="Auto-Open Pulse" description="Immediately engage Pulse protocol after creating a new objective."><Toggle enabled={settings.autoOpenPulse} onToggle={() => onUpdate('autoOpenPulse', !settings.autoOpenPulse)} /></SettingsRow>
+        <SettingsRow label="Contextual Suggestions" description="Suggest Pulse engagement for 'Due Today' assignments."><Toggle enabled={settings.suggestPulseDueToday} onToggle={() => onUpdate('suggestPulseDueToday', !settings.suggestPulseDueToday)} /></SettingsRow>
+      </SettingsGroup>
+      <SettingsGroup title="Submission Safety">
+        <SettingsRow label="Confirm External Access" description="Prompt for confirmation before opening the school portal."><Toggle enabled={settings.confirmSubmission} onToggle={() => onUpdate('confirmSubmission', !settings.confirmSubmission)} /></SettingsRow>
+        <SettingsRow label="Submission Checklist" description="Display tactical checklist on assignment cards."><Toggle enabled={settings.showChecklist} onToggle={() => onUpdate('showChecklist', !settings.showChecklist)} /></SettingsRow>
+        <SettingsRow label="Post-Submit Lock" description="Mark assignments as read-only once submitted."><Toggle enabled={settings.lockAfterSubmission} onToggle={() => onUpdate('lockAfterSubmission', !settings.lockAfterSubmission)} /></SettingsRow>
+      </SettingsGroup>
+      <SettingsGroup title="Interaction & Audio">
+        <SettingsRow label="Confirm Deletions" description="Always verify before purging a tactical objective."><Toggle enabled={settings.confirmDelete} onToggle={() => onUpdate('confirmDelete', !settings.confirmDelete)} /></SettingsRow>
+        <SettingsRow label="Aural Feedback" description="Interface audio cues for protocol actions."><Toggle enabled={settings.soundEffects} onToggle={() => onUpdate('soundEffects', !settings.soundEffects)} /></SettingsRow>
+        <SettingsRow label="Tactical Guidance" description="Restart the operational onboarding tour."><button onClick={onRestartTour} className="px-6 py-2 bg-blue-500/10 text-blue-500 rounded-xl text-[10px] font-bold uppercase tracking-widest border border-blue-500/20">Restart Tour</button></SettingsRow>
+      </SettingsGroup>
+      <SettingsGroup title="Display Architecture">
+        <SettingsRow label="Theme Protocol"><SegmentedControl active={settings.theme} onChange={(v) => onUpdate('theme', v)} options={[{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }, { value: 'system', label: 'System' }]} /></SettingsRow>
+        <SettingsRow label="Card Density" description="Adjust spacing and scale of the Tactical Board components."><SegmentedControl active={settings.cardSize} onChange={(v) => onUpdate('cardSize', v)} options={[{ value: 'compact', label: 'Compact' }, { value: 'comfortable', label: 'Comfy' }]} /></SettingsRow>
+        <SettingsRow label="Reduce Motion" description="Disable fluid interface transitions for lower sensory input."><Toggle enabled={settings.reduceMotion} onToggle={() => onUpdate('reduceMotion', !settings.reduceMotion)} /></SettingsRow>
+      </SettingsGroup>
+      <SettingsGroup title="Data Operations">
+        <SettingsRow label="Purge Memory" description="Irreversibly wipe all objectives and tactical data."><button onClick={onClearAll} className="px-6 py-2 bg-rose-500/10 text-rose-500 rounded-xl text-[10px] font-bold uppercase tracking-widest border border-blue-500/20">Purge Data</button></SettingsRow>
+        <SettingsRow label="Terminate Session" last><button onClick={onSignOut} className="px-6 py-2 bg-gray-100 dark:bg-white/5 rounded-xl text-[10px] font-bold uppercase tracking-widest">Sign Out</button></SettingsRow>
+      </SettingsGroup>
+    </div>
+  );
+};
+
+const PasteModal: React.FC<{ isOpen: boolean; onClose: () => void; onAdd: (text: string) => void }> = ({ isOpen, onClose, onAdd }) => {
+  const [text, setText] = useState(''); const handleAdd = () => { onAdd(text); setText(''); onClose(); };
+  return (
+    <AnimatePresence>
+      {isOpen && <div className="fixed inset-0 z-[200] flex items-center justify-center p-6"><motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" /><motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-14 border border-white/10 shadow-2xl"><div className="flex items-center justify-between mb-10"><h2 className="text-3xl font-bold tracking-tighter">Paste Content.</h2><button onClick={onClose} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button></div><textarea autoFocus value={text} onChange={e => setText(e.target.value)} placeholder="Paste large blocks of text or context here..." className="w-full h-80 bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 rounded-[2.5rem] p-10 outline-none focus:border-blue-500/50 text-lg font-medium resize-none transition-all mb-10" /><button onClick={handleAdd} disabled={!text.trim()} className="w-full py-8 bg-blue-600 text-white rounded-[2.5rem] font-bold uppercase tracking-[0.2em] text-sm shadow-2xl shadow-blue-500/30 active:scale-[0.98] transition-all disabled:opacity-50">Inject Into Pulse</button></motion.div></div>}
+    </AnimatePresence>
+  );
+};
+
+// --- Portal Submit Modal ---
+const SUBJECT_PREFIXES = [
+  { value: "Ara", label: "ARABIC" },
+  { value: "Art", label: "ART" },
+  { value: "Bio", label: "BIOLOGY" },
+  { value: "English", label: "ENGLISH" },
+  { value: "Ger", label: "GERMAN" },
+  { value: "IT", label: "INFORMATION TECHNOLOGY" },
+  { value: "Math", label: "MATH" },
+  { value: "MOE", label: "ARABIC HISTORY" },
+  { value: "PE", label: "PHYSICAL EDUCATION" },
+  { value: "Rel", label: "RELIGION" },
+  { value: "SS", label: "SOCIAL STUDIES" }
+];
+
+const PortalSubmitModal: React.FC<{ isOpen: boolean; onClose: () => void; assignment: Assignment | null; reduceMotion: boolean; onNavigateToSettings: () => void; onSuccessfulSubmit: (id: string) => void }> = ({ isOpen, onClose, assignment, reduceMotion, onNavigateToSettings, onSuccessfulSubmit }) => {
+  const [subject, setSubject] = useState(assignment?.subject ? (SUBJECT_PREFIXES.find(s => assignment.subject.toLowerCase().startsWith(s.label.toLowerCase()))?.value || SUBJECT_PREFIXES[0].value) : SUBJECT_PREFIXES[0].value);
+  const [assignmentName, setAssignmentName] = useState(assignment?.title || '');
+  const [file, setFile] = useState<File | null>(null);
+  const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error' | 'missing_creds'>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (assignment) {
+      const match = SUBJECT_PREFIXES.find(s => assignment.subject.toLowerCase().startsWith(s.label.toLowerCase()));
+      if (match) setSubject(match.value);
+      setAssignmentName(assignment.title);
+    }
+  }, [assignment]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!file || !assignmentName) return;
+
+    const email = localStorage.getItem('flash-operator-email') || '';
+    const password = localStorage.getItem('flash-operator-password') || '';
+
+    if (!email || !password) {
+      setStatus('missing_creds');
+      playUISound('error');
+      return;
+    }
+
+    setStatus('processing');
+    setErrorMsg(null);
+    playUISound('action');
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('student_name', 'Abdelaziz, Omar');
+    formData.append('class_prefix', subject);
+    formData.append('assignment_code', assignmentName);
+    formData.append('email', email);
+    formData.append('password', password);
+
+    try {
+      const response = await fetch('https://306e10a557c9.ngrok-free.app/auto-submit', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (response.ok) {
+        setStatus('success');
+        playUISound('success');
+        if (assignment) {
+          onSuccessfulSubmit(assignment.id);
+        }
+        setTimeout(() => {
+          onClose();
+          setStatus('idle');
+          setFile(null);
+        }, 2000);
+      } else if (response.status === 401) {
+        throw new Error('Authentication Failed: Check Portal Credentials.');
+      } else {
+        throw new Error('Server returned non-ok response');
+      }
+    } catch (err: any) {
+      console.error("Submission failed:", err);
+      setErrorMsg(err.message || 'Protocol Failure.');
+      setStatus('error');
+      playUISound('error');
+    }
+  };
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") setIsDragging(true);
+    else if (e.type === "dragleave") setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      setFile(e.dataTransfer.files[0]);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return createPortal(
+    <div className="fixed inset-0 z-[1000] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" />
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9, y: 30 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.9, y: 30 }}
+        className="relative w-full max-w-xl bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-12 overflow-hidden border border-white/10 shadow-2xl"
+      >
+        <div className="flex items-center justify-between mb-8">
+          <div className="space-y-1">
+            <span className="text-[10px] font-black uppercase tracking-[0.25em] text-blue-500 bg-blue-500/10 px-4 py-1.5 rounded-full">BETA Protocol</span>
+            <h2 className="text-3xl font-bold tracking-tighter">Automated Submission</h2>
+          </div>
+          <button onClick={onClose} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button>
+        </div>
+
+        <div className="mb-10 p-6 bg-amber-500/5 border border-amber-500/20 rounded-[2rem] flex items-start gap-5">
+          <Icons.Error className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-600/80 dark:text-amber-400/60 font-medium leading-relaxed">
+            Notice: This automated protocol is currently in Beta. Ensure your materials meet all technical requirements before initiating the BOT sequence.
+          </p>
+        </div>
+
+        {status === 'missing_creds' ? (
+          <div className="py-12 text-center space-y-8">
+            <Icons.Lock className="w-20 h-20 mx-auto text-rose-500 opacity-40" />
+            <div className="space-y-2">
+              <h3 className="text-2xl font-bold tracking-tighter">Offline Credentials</h3>
+              <p className="text-gray-500 font-medium max-w-xs mx-auto text-sm">Automated submission requires a configured Portal Sync in your system settings.</p>
+            </div>
+            <button
+              onClick={() => { onClose(); onNavigateToSettings(); }}
+              className="w-full py-6 bg-blue-600 text-white rounded-[2rem] font-bold uppercase tracking-widest text-xs shadow-xl shadow-blue-500/20"
+            >
+              Go to Settings
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-8">
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Subject Prefix</label>
+                <CustomSelect
+                  value={subject}
+                  onChange={setSubject}
+                  options={SUBJECT_PREFIXES}
+                  placeholder="Select subject prefix"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Assignment Name</label>
+                <input
+                  type="text"
+                  value={assignmentName}
+                  onChange={e => setAssignmentName(e.target.value)}
+                  placeholder="Ex: Homework-2"
+                  className="w-full bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 p-6 rounded-[2rem] outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium transition-all"
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Submission Material</label>
+                <div
+                  onDragEnter={handleDrag}
+                  onDragOver={handleDrag}
+                  onDragLeave={handleDrag}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  className={`relative w-full h-40 border-2 border-dashed rounded-[2.5rem] flex flex-col items-center justify-center transition-all cursor-pointer group ${isDragging ? 'border-blue-500 bg-blue-500/5' : file ? 'border-green-500/50 bg-green-500/[0.03]' : 'border-gray-200 dark:border-white/10 hover:border-blue-500/30'}`}
+                >
+                  <input type="file" ref={fileInputRef} onChange={e => setFile(e.target.files?.[0] || null)} hidden />
+                  <div className="flex flex-col items-center text-center px-6">
+                    {file ? (
+                      <>
+                        <Icons.Check className="w-8 h-8 text-green-500 mb-2" />
+                        <p className="text-sm font-bold text-gray-900 dark:text-white truncate max-w-[200px]">{file.name}</p>
+                        <p className="text-[9px] font-bold text-green-500 uppercase tracking-widest mt-1">Material Ready</p>
+                      </>
+                    ) : (
+                      <>
+                        <Icons.Upload className="w-8 h-8 text-gray-400 group-hover:text-blue-500 transition-colors mb-2" />
+                        <p className="text-sm font-bold text-gray-500">Drop file here or click to select</p>
+                        <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mt-1">PDF / IMAGES / DOCX</p>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-4">
+              {status === 'success' ? (
+                <div className="w-full py-7 bg-green-600 text-white rounded-[2.5rem] font-bold uppercase tracking-[0.2em] text-center flex items-center justify-center gap-3">
+                  <Icons.Check className="w-5 h-5" />
+                  <span>Protocol Successful</span>
+                </div>
+              ) : status === 'error' ? (
+                <div className="space-y-4">
+                  <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl text-rose-500 text-xs font-bold uppercase text-center">
+                    {errorMsg}
+                  </div>
+                  <button onClick={() => setStatus('idle')} className="w-full py-7 bg-rose-600 text-white rounded-[2.5rem] font-bold uppercase tracking-[0.2em] text-center flex items-center justify-center gap-3">
+                    <Icons.Restore className="w-5 h-5" />
+                    <span>Retry sequence</span>
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={status === 'processing' || !file || !assignmentName}
+                  className="w-full py-7 bg-gray-900 dark:bg-white text-white dark:text-black rounded-[2.5rem] font-bold uppercase tracking-[0.2em] shadow-2xl active:scale-95 transition-all text-sm flex items-center justify-center gap-3 disabled:opacity-50"
+                >
+                  {status === 'processing' ? <Icons.Spinner className="w-5 h-5" /> : <Icons.Bolt className="w-5 h-5" />}
+                  <span>{status === 'processing' ? "Status: Bot Active" : "Launch Submission"}</span>
+                </button>
+              )}
+            </div>
+          </form>
+        )}
+      </motion.div>
+    </div>, document.body
+  );
+};
+
+const BulkSubmitModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  assignments: Assignment[];
+  onSuccessfulSubmit: (id: string) => void;
+}> = ({ isOpen, onClose, assignments, onSuccessfulSubmit }) => {
+  const [files, setFiles] = useState<Record<string, File | null>>({});
+  const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
+  const [submissionProgress, setSubmissionProgress] = useState<Record<string, 'pending' | 'submitting' | 'success' | 'error'>>({});
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setFiles({});
+      setStatus('idle');
+      setErrorMsg(null);
+      setSubmissionProgress(
+        assignments.reduce((acc, a) => ({ ...acc, [a.id]: 'pending' }), {})
+      );
+    }
+  }, [isOpen, assignments]);
+
+  const handleFileChange = (assignmentId: string, file: File | null) => {
+    setFiles(prev => ({ ...prev, [assignmentId]: file }));
+  };
+
+  const handleSubmit = async () => {
+    const email = localStorage.getItem('flash-operator-email') || '';
+    const password = localStorage.getItem('flash-operator-password') || '';
+
+    if (!email || !password) {
+      setErrorMsg('Portal credentials not configured. Please go to Settings.');
+      setStatus('error');
+      playUISound('error');
+      return;
+    }
+
+    setStatus('processing');
+    setErrorMsg(null);
+    playUISound('action');
+
+    const assignmentsToSubmit = assignments.filter(a => files[a.id]);
+    let hasError = false;
+
+    await Promise.all(assignmentsToSubmit.map(async (assignment) => {
+      const file = files[assignment.id];
+      if (!file) return;
+
+      setSubmissionProgress(prev => ({ ...prev, [assignment.id]: 'submitting' }));
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('student_name', 'Abdelaziz, Omar');
+      const subjectMatch = SUBJECT_PREFIXES.find(s => assignment.subject.toLowerCase().startsWith(s.label.toLowerCase()));
+      formData.append('class_prefix', subjectMatch?.value || 'SS');
+      formData.append('assignment_code', assignment.title);
+      formData.append('email', email);
+      formData.append('password', password);
+
+      try {
+        const response = await fetch('https://306e10a557c9.ngrok-free.app/auto-submit', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (response.ok) {
+          setSubmissionProgress(prev => ({ ...prev, [assignment.id]: 'success' }));
+          onSuccessfulSubmit(assignment.id);
+        } else {
+          hasError = true;
+          throw new Error(`Submission failed for ${assignment.title}`);
+        }
+      } catch (err) {
+        hasError = true;
+        setSubmissionProgress(prev => ({ ...prev, [assignment.id]: 'error' }));
+        console.error(err);
+      }
+    }));
+
+    if (hasError) {
+      setStatus('error');
+      setErrorMsg('Some submissions failed. Please review and try again.');
+      playUISound('error');
+    } else {
+      setStatus('success');
+      playUISound('success');
+      setTimeout(() => {
+        onClose();
+        setTimeout(() => setStatus('idle'), 300);
+      }, 2000);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  const assignmentsWithFiles = Object.keys(files).filter(id => files[id]).length;
+
+  return createPortal(
+    <div className="fixed inset-0 z-[1000] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={status !== 'processing' ? onClose : undefined} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" />
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9, y: 30 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.9, y: 30 }}
+        className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-12 overflow-hidden border border-white/10 shadow-2xl max-h-[90vh] flex flex-col"
+      >
+        <div className="flex items-center justify-between mb-8 shrink-0">
+          <div className="space-y-1">
+            <h2 className="text-3xl font-bold tracking-tighter">Bulk Submission</h2>
+            <p className="text-gray-500 font-medium">Upload materials for multiple assignments.</p>
+          </div>
+          <button onClick={onClose} disabled={status === 'processing'} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button>
+        </div>
+
+        {errorMsg && (
+          <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl text-rose-500 text-xs font-bold uppercase tracking-widest flex items-center gap-3 mb-4 shrink-0">
+            <Icons.Error className="w-4 h-4" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto -mx-12 px-12 space-y-4">
+          {assignments.map(assignment => {
+            const file = files[assignment.id];
+            const progress = submissionProgress[assignment.id];
+
+            return (
+              <div key={assignment.id} className="flex items-center gap-4 p-4 bg-gray-50 dark:bg-white/5 rounded-2xl">
+                <div className="flex-1 min-w-0">
+                  <p className="font-bold truncate">{assignment.title}</p>
+                  <p className="text-xs text-gray-400 uppercase">{assignment.subject}</p>
+                </div>
+                <div className="w-48 shrink-0">
+                  {progress === 'submitting' && <div className="flex items-center gap-2 text-blue-500"><Icons.Spinner className="w-4 h-4" /><span className="text-xs font-bold uppercase">Submitting...</span></div>}
+                  {progress === 'success' && <div className="flex items-center gap-2 text-green-500"><Icons.Check className="w-4 h-4" /><span className="text-xs font-bold uppercase">Submitted</span></div>}
+                  {progress === 'error' && <div className="flex items-center gap-2 text-rose-500"><Icons.Error className="w-4 h-4" /><span className="text-xs font-bold uppercase">Failed</span></div>}
+                  {progress === 'pending' && (
+                    <label className="flex items-center gap-2 cursor-pointer text-gray-400 hover:text-blue-500 transition-colors">
+                      <input type="file" className="hidden" onChange={e => handleFileChange(assignment.id, e.target.files ? e.target.files[0] : null)} />
+                      {file ? (
+                        <div className="flex items-center gap-2">
+                          <Icons.FileText className="w-4 h-4 text-blue-500" />
+                          <span className="text-xs font-bold text-blue-500 truncate">{file.name}</span>
+                        </div>
+                      ) : (
+                        <>
+                          <Icons.Paperclip className="w-4 h-4" />
+                          <span className="text-xs font-bold uppercase">Attach File</span>
+                        </>
+                      )}
+                    </label>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="pt-8 shrink-0">
+          <button
+            onClick={handleSubmit}
+            disabled={status === 'processing' || assignmentsWithFiles === 0}
+            className="w-full py-7 bg-gray-900 dark:bg-white text-white dark:text-black rounded-[2.5rem] font-bold uppercase tracking-[0.2em] shadow-2xl active:scale-95 transition-all text-sm flex items-center justify-center gap-3 disabled:opacity-50"
+          >
+            {status === 'processing' ? <Icons.Spinner className="w-5 h-5" /> : (status === 'success' ? <Icons.Check className="w-5 h-5" /> : <Icons.Bolt className="w-5 h-5" />)}
+            <span>
+              {status === 'processing' ? `Submitting...` :
+                status === 'success' ? 'All Submitted' :
+                  status === 'error' ? 'Retry Failed' :
+                    `Submit ${assignmentsWithFiles} Assignment(s)`
+              }
+            </span>
+          </button>
+        </div>
+      </motion.div>
+    </div>,
+    document.body
+  );
+};
+
+const InSessionModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  assignments: Assignment[];
+  sessionSubject: string;
+  onComplete: (id: string) => void;
+  onPulse: (id: string) => void;
+}> = ({ isOpen, onClose, assignments, sessionSubject, onComplete, onPulse }) => {
+
+  const gradeImpact = (assignment: Assignment) => {
+    return getGradeImpact(assignment);
+  };
+
+  if (!isOpen) return null;
+
+  return createPortal(
+    <div className="fixed inset-0 z-[1000] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" />
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9, y: 30 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.9, y: 30 }}
+        className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-12 border border-white/10 shadow-2xl"
+      >
+        <div className="flex items-center justify-between mb-8">
+          <div className="space-y-1">
+            <h2 className="text-3xl font-bold tracking-tighter">Session Objectives: <span className="text-blue-500 uppercase">{sessionSubject}</span></h2>
+            <p className="text-gray-500 font-medium">The following tactical objectives are due today.</p>
+          </div>
+          <button onClick={onClose} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button>
+        </div>
+
+        <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">
+          {assignments.map(assignment => (
+            <div key={assignment.id} className="bg-gray-50 dark:bg-white/5 p-6 rounded-3xl flex items-center justify-between gap-4">
+              <div className="flex-1 space-y-1 min-w-0">
+                <p className="font-bold truncate">{assignment.title}</p>
+                <div className="flex items-center gap-2 text-green-500">
+                  <Icons.Percent className="w-3.5 h-3.5" />
+                  <span className="text-xs font-bold uppercase tracking-widest">+{gradeImpact(assignment)}% Grade Impact</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <button onClick={() => onPulse(assignment.id)} className="px-5 py-3 bg-blue-500/10 text-blue-500 rounded-xl text-[10px] font-bold uppercase tracking-widest border border-blue-500/20 hover:bg-blue-500/20 transition-colors">Pulse AI</button>
+                <button onClick={() => onComplete(assignment.id)} className="px-5 py-3 bg-green-500/10 text-green-500 rounded-xl text-[10px] font-bold uppercase tracking-widest border border-green-500/20 hover:bg-green-500/20 transition-colors">Complete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </motion.div>
+    </div>,
+    document.body
+  );
+};
+
+const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
+  const [activeTab, setActiveTab] = useState<Tab>('assignments');
+  const [viewMode, setViewMode] = useState<ViewMode>('grid');
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isScraperOpen, setIsScraperOpen] = useState(false);
+  const [isBulkSubmitOpen, setIsBulkSubmitOpen] = useState(false);
+  const [isSignOutModalOpen, setIsSignOutModalOpen] = useState(false);
+  const [isClearAllModalOpen, setIsClearAllModalOpen] = useState(false);
+  const [isClearBoardModalOpen, setIsClearBoardModalOpen] = useState(false);
+  const [isPortalSubmitOpen, setIsPortalSubmitOpen] = useState(false);
+  const [submittingAssignment, setSubmittingAssignment] = useState<Assignment | null>(null);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [activeAssignmentId, setActiveAssignmentId] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [editingAssignment, setEditingAssignment] = useState<Assignment | null>(null);
+  const [undoItem, setUndoItem] = useState<{ item: Assignment, index: number } | null>(null);
+  const [xpChange, setXpChange] = useState<number | null>(null);
+  const [showTour, setShowTour] = useState(false);
+  const [showClassSelector, setShowClassSelector] = useState(false);
+  const [showMandatoryPortalSetup, setShowMandatoryPortalSetup] = useState(false);
+  const [showFirstSyncPrompt, setShowFirstSyncPrompt] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshProgress, setRefreshProgress] = useState(0);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [showInSessionModal, setShowInSessionModal] = useState(false);
+  const [inSessionAssignments, setInSessionAssignments] = useState<Assignment[]>([]);
+  const [currentSessionSubject, setCurrentSessionSubject] = useState<string>('');
+  const dismissedSessionRef = useRef<string | null>(null);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  // Simulator State
+  const [simMode, setSimMode] = useState<'skip' | 'work'>('skip');
+  const [simSubject, setSimSubject] = useState<string>('');
+  const [simCategory, setSimCategory] = useState<keyof typeof WEIGHTS>('classwork');
+  const [simNumToSimulate, setSimNumToSimulate] = useState<string>('1');
+  const [simItemCount, setSimItemCount] = useState<string>(String(DEFAULT_COUNTS.classwork));
+  const [simHypotheticalScore, setSimHypotheticalScore] = useState<string>('0');
+
+  const [userProfile, setUserProfile] = useState<UserProfile>(() => { const saved = localStorage.getItem('flash-user-profile'); return saved ? JSON.parse(saved) : { uid: 'me', displayName: auth.currentUser?.email?.split('@')[0] || 'Operator', xp: 0 }; });
+  const [settings, setSettings] = useState<AppSettings>(() => { const saved = localStorage.getItem('flash-settings'); const defaults: AppSettings = { theme: 'dark', reduceMotion: false, compactMode: false, autoArchive: true, confirmDelete: true, soundEffects: true, tourCompleted: false, selectedClass: undefined, defaultPulseStrategy: 'scholar', defaultPulseIntelligence: 'fast', autoOpenPulse: false, suggestPulseDueToday: true, confirmSubmission: true, showChecklist: false, lockAfterSubmission: false, cardSize: 'comfortable' }; return saved ? { ...defaults, ...JSON.parse(saved) } : defaults; });
+
+  const [pulseMessages, setPulseMessages] = useState<PulseMessage[]>(() => {
+    const saved = localStorage.getItem('flash-pulse-messages');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [pulseProtocol, setPulseProtocol] = useState<PulseMode>(() => {
+    const saved = localStorage.getItem('flash-pulse-protocol');
+    return (saved as PulseMode) || 'general';
+  });
+  const [pulseStrategy, setPulseStrategy] = useState<Strategy>(() => {
+    const saved = localStorage.getItem('flash-pulse-strategy');
+    return (saved as Strategy) || settings.defaultPulseStrategy;
+  });
+  const [pulseIntelligence, setPulseIntelligence] = useState<Intelligence>(() => {
+    const saved = localStorage.getItem('flash-pulse-intelligence');
+    return (saved as Intelligence) || settings.defaultPulseIntelligence;
+  });
+
+  const currentGrades = useMemo(() => {
+    const saved = localStorage.getItem('flash-grades');
+    return saved ? JSON.parse(saved) : [];
+  }, [activeTab]);
+
+  const drive = useGoogleDrive();
+
+  // Detect current subject based on active assignment
+  const currentSubject = useMemo(() => {
+    const activeAssignment = assignments.find(a => a.id === activeAssignmentId);
+    return activeAssignment?.subject || null;
+  }, [activeAssignmentId, assignments]);
+
+  const isMac = useMemo(() => typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform), []);
+  const modKey = isMac ? 'Cmd' : 'Ctrl';
+
+  useEffect(() => { localStorage.setItem('flash-settings', JSON.stringify(settings)); }, [settings]);
+  useEffect(() => { localStorage.setItem('flash-user-profile', JSON.stringify(userProfile)); }, [userProfile]);
+  useEffect(() => { document.documentElement.classList.toggle('dark', settings.theme === 'dark' || (settings.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)); }, [settings.theme]);
+  useEffect(() => { const saved = localStorage.getItem('flash-assignments'); if (saved) setAssignments(JSON.parse(saved)); }, []);
+  useEffect(() => { localStorage.setItem('flash-assignments', JSON.stringify(assignments)); }, [assignments]);
+
+  useEffect(() => {
+    if (!settings.tourCompleted) {
+      const timer = setTimeout(() => setShowTour(true), 1200);
+      return () => clearTimeout(timer);
+    } else if (!settings.selectedClass) {
+      setShowClassSelector(true);
+    } else if (!localStorage.getItem('flash-operator-email')) {
+      setShowMandatoryPortalSetup(true);
+    }
+  }, [settings.tourCompleted, settings.selectedClass]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const session = getCurrentAndNextSession(settings.selectedClass);
+      const sessionSubject = normalizeSubject(session.current);
+
+      if (sessionSubject !== dismissedSessionRef.current) {
+        dismissedSessionRef.current = null;
+      }
+
+      if (sessionSubject !== "WEEKEND" && sessionSubject !== "BREAK" && sessionSubject !== "OUT OF HOURS" && sessionSubject !== "TRANSITION / FREE") {
+        const dueTodayInSession = assignments.filter(a =>
+          !a.isCompleted &&
+          isDateToday(a.dueDate) &&
+          normalizeSubject(a.subject) === sessionSubject
+        );
+
+        if (dueTodayInSession.length > 0 && dismissedSessionRef.current !== sessionSubject) {
+          setInSessionAssignments(dueTodayInSession);
+          setCurrentSessionSubject(session.current);
+          setShowInSessionModal(true);
+        }
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [assignments, settings.selectedClass]);
+
+
+  useEffect(() => { localStorage.setItem('flash-pulse-messages', JSON.stringify(pulseMessages)); }, [pulseMessages]);
+  useEffect(() => { localStorage.setItem('flash-pulse-protocol', pulseProtocol); }, [pulseProtocol]);
+  useEffect(() => { localStorage.setItem('flash-pulse-strategy', pulseStrategy); }, [pulseStrategy]);
+  useEffect(() => { localStorage.setItem('flash-pulse-intelligence', pulseIntelligence); }, [pulseIntelligence]);
+
+  const earnXP = useCallback((amount: number) => { setUserProfile(prev => ({ ...prev, xp: prev.xp + amount })); setXpChange(amount); setTimeout(() => setXpChange(null), 2000); }, []);
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check if user is typing in an input field
+      const target = e.target as HTMLElement;
+      const isTyping = target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable;
+
+      // Only allow Escape key when typing, ignore all other shortcuts
+      if (isTyping && e.key !== 'Escape') {
+        return;
+      }
+
+      if (e.metaKey || e.ctrlKey) { if (e.key === 'j') { e.preventDefault(); setIsModalOpen(true); playUISound('action'); } if (e.key === '1') setActiveTab('assignments'); if (e.key === '2') setActiveTab('history'); if (e.key === '3') setActiveTab('pulse'); if (e.key === '4') setActiveTab('leaderboard'); if (e.key === '5') setActiveTab('integrations'); if (e.key === '6') setActiveTab('settings'); } if (e.key === 'Escape') { if (!isScraperOpen && !isBulkSubmitOpen) { setIsModalOpen(false); setIsSignOutModalOpen(false); setIsClearAllModalOpen(false); setIsClearBoardModalOpen(false); setPendingDeleteId(null); setEditingAssignment(null); setIsPortalSubmitOpen(false); setShowInSessionModal(false) } }
+    }; window.addEventListener('keydown', handleKeyDown); return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isScraperOpen, isBulkSubmitOpen]);
+  const updateSetting = (key: keyof AppSettings, value: any) => setSettings(prev => ({ ...prev, [key]: value }));
+  const handleSignOutConfirmed = async () => {
+    playUISound('action');
+    localStorage.removeItem('flash-operator-email');
+    localStorage.removeItem('flash-operator-password');
+    onSignOut ? onSignOut() : await signOut(auth);
+  };
+  const addAssignment = (a: Assignment) => { setAssignments(prev => [a, ...prev]); setIsModalOpen(false); playUISound('success'); earnXP(3); if (settings.autoOpenPulse) { setActiveAssignmentId(a.id); handlePulseSelect(a); } };
+  const updateAssignment = (updated: Assignment) => { setAssignments(prev => prev.map(a => a.id === updated.id ? updated : a)); setIsModalOpen(false); setEditingAssignment(null); playUISound('success'); };
+  const addAssignments = (newItems: Assignment[]) => {
+    const existingTitles = new Set(assignments.map(a => `${a.subject}-${a.title}`));
+    const uniqueNewItems = newItems.filter(item => !existingTitles.has(`${item.subject}-${item.title}`));
+    if (uniqueNewItems.length > 0) {
+      setAssignments(prev => [...uniqueNewItems, ...prev]);
+      playUISound('success');
+      earnXP(uniqueNewItems.length * 3);
+    }
+    setIsScraperOpen(false);
+    setActiveTab('assignments');
+  };
+  const removeAssignment = (id: string) => { const item = assignments.find(a => a.id === id); if (!item) return; const index = assignments.indexOf(item); setUndoItem({ item, index }); setAssignments(prev => prev.filter(a => a.id !== id)); setPendingDeleteId(null); playUISound('action'); setTimeout(() => setUndoItem(null), 5000); };
+  const handleUndo = () => { if (undoItem) { const newAssignments = [...assignments]; newAssignments.splice(undoItem.index, 0, undoItem.item); setAssignments(newAssignments); setUndoItem(null); playUISound('action'); } };
+
+  const { overdueAssignments, upcomingAssignments, historyAssignments, hasActiveAssignments } = useMemo(() => {
+    const overdue: Assignment[] = [];
+    const upcoming: Assignment[] = [];
+    const history: Assignment[] = [];
+
+    assignments.forEach(a => {
+      if (a.isCompleted) {
+        history.push(a);
+      } else if (a.dueDate && isDateInPast(a.dueDate)) {
+        overdue.push(a);
+      } else {
+        upcoming.push(a);
+      }
+    });
+
+    return {
+      overdueAssignments: overdue.sort((a, b) => new Date(a.dueDate!).getTime() - new Date(b.dueDate!).getTime()),
+      upcomingAssignments: upcoming,
+      historyAssignments: history.sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0)),
+      hasActiveAssignments: overdue.length > 0 || upcoming.length > 0
+    };
+  }, [assignments]);
+
+  const upcomingGrouped = useMemo(() => { const groups: Record<string, Assignment[]> = {}; upcomingAssignments.forEach(a => { groups[a.subject] = groups[a.subject] || []; groups[a.subject].push(a); }); return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)); }, [upcomingAssignments]);
+  const historyGrouped = useMemo(() => { const groups: Record<string, Assignment[]> = {}; historyAssignments.forEach(a => { groups[a.subject] = groups[a.subject] || []; groups[a.subject].push(a); }); return Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)); }, [historyAssignments]);
+
+  const handleClassSelection = (c: UserClass) => { updateSetting('selectedClass', c); setShowClassSelector(false); earnXP(10); };
+
+  const handleMandatoryPortalSetup = (email: string, pass: string) => {
+    localStorage.setItem('flash-operator-email', email);
+    localStorage.setItem('flash-operator-password', pass);
+    setShowMandatoryPortalSetup(false);
+    earnXP(15);
+    if (!localStorage.getItem('flash-grades')) {
+      setShowFirstSyncPrompt(true);
+    }
+  };
+
+  const handleSuccessfulPortalSubmit = (id: string) => {
+    setAssignments(prev => prev.map(a => a.id === id ? { ...a, isCompleted: true, completedAt: Date.now() } : a));
+    earnXP(15);
+  };
+
+  const handlePortalSubmitInit = (a: Assignment) => {
+    setSubmittingAssignment(a);
+    setIsPortalSubmitOpen(true);
+    playUISound('action');
+  };
+
+  const handleRefreshAssignments = async () => {
+    const email = localStorage.getItem('flash-operator-email');
+    const password = localStorage.getItem('flash-operator-password');
+    if (!email || !password) {
+      setRefreshError('Offline Logic: Configure Portal Sync in Settings.');
+      playUISound('error');
+      return;
+    }
+
+    setIsRefreshing(true);
+    setRefreshProgress(0);
+    setRefreshError(null);
+    playUISound('action');
+
+    try {
+      // Start progress simulation
+      setRefreshProgress(10);
+
+      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-schoolwork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+
+      setRefreshProgress(40);
+
+      if (!response.ok) {
+        if (response.status === 401) throw new Error('Authentication Failed: Check Portal Sync.');
+        throw new Error('Uplink failed.');
+      }
+
+      setRefreshProgress(60);
+      const data = await response.json();
+
+      setRefreshProgress(80);
+      const rawText = data.markdown || data.text || (typeof data === 'string' ? data : JSON.stringify(data));
+      const parsedAssignments = await parseRawTextToAssignments(rawText);
+
+      setRefreshProgress(95);
+      if (parsedAssignments.length > 0) {
+        addAssignments(parsedAssignments.map(a => ({ ...a, subject: normalizeSubject(a.subject) })));
+        setRefreshProgress(100);
+        playUISound('success');
+        // Set timestamp for Pulse to detect and show visual briefing
+        localStorage.setItem('flash-tactical-refresh-timestamp', Date.now().toString());
+      } else {
+        setRefreshError('No actionable signals identified');
+      }
+    } catch (err: any) {
+      setRefreshError(err.message || 'Sequence failure.');
+      playUISound('error');
+    } finally {
+      setTimeout(() => {
+        setIsRefreshing(false);
+        setRefreshProgress(0);
+      }, 800);
+      setTimeout(() => setRefreshError(null), 4000);
+    }
+  };
+
+  const handlePulseSelect = (assignment: Assignment) => {
+    setActiveAssignmentId(assignment.id);
+    setActiveTab('pulse');
+
+    const subject = normalizeSubject(assignment.subject);
+    let newProtocol: PulseMode = 'general';
+    if (subject === 'SOCIAL STUDIES') newProtocol = 'lens';
+    else if (subject === 'BIOLOGY') newProtocol = 'framework';
+    else if (subject === 'ENGLISH') newProtocol = 'interpret';
+    else if (['ARABIC', 'ISLAMIC STUDIES', 'RELIGION'].includes(subject)) newProtocol = 'saqr';
+
+    setPulseProtocol(newProtocol);
+    playUISound('action');
+  };
+
+  return (
+    <MotionConfig transition={settings.reduceMotion ? { duration: 0 } : undefined}>
+      <div className="flex h-screen bg-white dark:bg-[#0a0a0a] text-gray-900 dark:text-white overflow-hidden transition-colors duration-500">
+        <LoadingBar isVisible={isRefreshing} progress={refreshProgress} label="Tactical Refresh" />
+
+        {/* Subject-aware objectives dropdown */}
+        <SubjectObjectivesDropdown
+          currentSubject={currentSubject}
+          allAssignments={assignments}
+          onSelectAssignment={setActiveAssignmentId}
+          playUISound={playUISound}
+        />
+
+        <AnimatePresence>
+          {isMobileMenuOpen && (
+            <MobileMenu
+              isOpen={isMobileMenuOpen}
+              onClose={() => setIsMobileMenuOpen(false)}
+              activeTab={activeTab}
+              setActiveTab={setActiveTab}
+              settings={settings}
+              toggleTheme={() => updateSetting('theme', settings.theme === 'dark' ? 'light' : 'dark')}
+              hasActiveAssignments={hasActiveAssignments}
+            />
+          )}
+        </AnimatePresence>
+        <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} settings={settings} toggleTheme={() => updateSetting('theme', settings.theme === 'dark' ? 'light' : 'dark')} hasActiveAssignments={hasActiveAssignments} />
+        <div className="flex-1 flex flex-col min-w-0 relative">
+          <Header settings={settings} toggleTheme={() => updateSetting('theme', settings.theme === 'dark' ? 'light' : 'dark')} userProfile={userProfile} xpChange={xpChange} onMenuClick={() => setIsMobileMenuOpen(true)} />
+          <main className="flex-1 overflow-hidden relative bg-gray-50/20 dark:bg-background">
+            <AnimatePresence mode="wait">
+              {activeTab === 'assignments' && (
+                <motion.div key="assignments" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20 max-w-7xl mx-auto">
+                  <div className="flex flex-col sm:flex-row items-start justify-between gap-6 mb-8 sm:mb-12">
+                    <div className="space-y-3 sm:space-y-4" id="tour-board-header">
+                      <h1 className="text-4xl sm:text-5xl lg:text-7xl font-bold tracking-tighter">Tactical Board.</h1>
+                      <div className="flex items-center gap-6">
+                        <div className="flex items-center gap-3 text-gray-400 font-bold opacity-40">
+                          <Icons.Command className="w-5 h-5" />
+                          <span className="text-[11px] tracking-[0.25em] uppercase">{modKey} + J to establish objective</span>
+                        </div>
+                        <AnimatePresence>
+                          {refreshError && (
+                            <motion.div initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0 }} className="text-[10px] font-black uppercase text-rose-500 tracking-widest bg-rose-500/5 px-4 py-2 rounded-full border border-rose-500/10 flex items-center gap-2">
+                              <Icons.Error className="w-3.5 h-3.5" />
+                              <span>{refreshError}</span>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <button onClick={() => setIsBulkSubmitOpen(true)} className="px-10 py-6 border border-gray-200 dark:border-white/10 hover:border-blue-500/50 text-gray-500 dark:text-gray-400 hover:text-blue-500 rounded-[2.5rem] font-bold uppercase tracking-widest transition-all text-xs flex items-center justify-center gap-3">
+                        <Icons.UploadCloud className="w-4 h-4" />
+                        <span>Bulk Submit</span>
+                      </button>
+                      <button onClick={handleRefreshAssignments} disabled={isRefreshing} className="px-10 py-6 border border-gray-200 dark:border-white/10 hover:border-blue-500/50 text-gray-500 dark:text-gray-400 hover:text-blue-500 rounded-[2.5rem] font-bold uppercase tracking-widest transition-all text-xs flex items-center justify-center gap-3 disabled:opacity-50">
+                        {isRefreshing ? <Icons.Spinner className="w-4 h-4" /> : <Icons.Restore className="w-4 h-4" />}
+                        <span>{isRefreshing ? 'Refreshing...' : 'Tactical Refresh'}</span>
+                      </button>
+                      <button id="tour-new-objective" onClick={() => { setIsModalOpen(true); playUISound('action'); }} className="bg-gray-900 dark:bg-white text-white dark:text-black px-12 py-6 rounded-[2.5rem] font-bold uppercase tracking-widest shadow-2xl hover:opacity-90 active:scale-95 transition-all">New Objective</button>
+                    </div>
+                  </div>
+
+                  <AnimatePresence>
+                    {hasActiveAssignments && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        transition={{ duration: 0.5, ease: 'easeInOut' }}
+                        className="mb-12" id="tour-stats-header"
+                      >
+                        <StatsHeader assignments={assignments} grades={currentGrades} />
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  <div id="tour-view-toggle" className="flex items-center justify-end mb-12">
+                    <div className="flex bg-gray-100 dark:bg-white/5 p-1 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm">
+                      <button onClick={() => { playUISound('switch'); setViewMode('grid'); }} className={`px-5 py-3 rounded-xl transition-all ${viewMode === 'grid' ? 'bg-white dark:bg-white/10 shadow-md text-gray-900 dark:text-white' : 'text-gray-400'}`}><Icons.Layout className="w-5 h-5" /></button>
+                      <button onClick={() => { playUISound('switch'); setViewMode('list'); }} className={`px-5 py-3 rounded-xl transition-all ${viewMode === 'list' ? 'bg-white dark:bg-white/10 shadow-md text-gray-900 dark:text-white' : 'text-gray-400'}`}><Icons.List className="w-5 h-5" /></button>
+                    </div>
+                  </div>
+
+                  {!hasActiveAssignments ? <EmptyState onClick={() => setIsModalOpen(true)} title="No Active Signals" desc="Establish your first objective. Manual entry or screenshot-based AI ingestion." /> : (
+                    <div className="space-y-32 pb-40">
+                      {viewMode === 'grid' ? (
+                        <>
+                          {overdueAssignments.length > 0 && (
+                            <SubjectSection
+                              isOverdue
+                              subject="Overdue"
+                              items={overdueAssignments}
+                              renderCard={(a) => <AssignmentCard key={a.id} assignment={a} settings={settings} currentGrades={currentGrades} onEdit={() => { setEditingAssignment(a); setIsModalOpen(true); }} onRemove={() => { if (settings.confirmDelete) setPendingDeleteId(a.id); else removeAssignment(a.id); }} onComplete={() => { setAssignments(prev => prev.map(item => item.id === a.id ? { ...item, isCompleted: true, completedAt: Date.now() } : item)); earnXP(10); }} onFirstSubmit={() => earnXP(5)} onPortalSubmit={handlePortalSubmitInit} onSelect={() => handlePulseSelect(a)} reduceMotion={settings.reduceMotion} />}
+                            />
+                          )}
+                          {upcomingGrouped.map(([subject, items]) => <SubjectSection key={subject} subject={subject} items={items} renderCard={(a) => <AssignmentCard key={a.id} assignment={a} settings={settings} currentGrades={currentGrades} onEdit={() => { setEditingAssignment(a); setIsModalOpen(true); }} onRemove={() => { if (settings.confirmDelete) setPendingDeleteId(a.id); else removeAssignment(a.id); }} onComplete={() => { setAssignments(prev => prev.map(item => item.id === a.id ? { ...item, isCompleted: true, completedAt: Date.now() } : item)); earnXP(10); }} onFirstSubmit={() => earnXP(5)} onPortalSubmit={handlePortalSubmitInit} onSelect={() => handlePulseSelect(a)} reduceMotion={settings.reduceMotion} />} />)}
+                        </>
+                      ) : (
+                        <AssignmentList assignments={[...overdueAssignments, ...upcomingAssignments]} />
+                      )}
+                    </div>
+                  )}
+                </motion.div>
+              )}
+              {activeTab === 'history' && <motion.div key="history" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-8 md:px-20 py-20 max-w-7xl mx-auto">
+                <div className="flex items-center justify-between mb-24">
+                  <h1 className="text-7xl font-bold tracking-tighter">Memory Archive.</h1>
+                  <div className="flex bg-gray-100 dark:bg-white/5 p-1 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm">
+                    <button onClick={() => { playUISound('switch'); setViewMode('grid'); }} className={`px-5 py-3 rounded-xl transition-all ${viewMode === 'grid' ? 'bg-white dark:bg-white/10 shadow-md text-gray-900 dark:text-white' : 'text-gray-400'}`}><Icons.Layout className="w-5 h-5" /></button>
+                    <button onClick={() => { playUISound('switch'); setViewMode('list'); }} className={`px-5 py-3 rounded-xl transition-all ${viewMode === 'list' ? 'bg-white dark:bg-white/10 shadow-md text-gray-900 dark:text-white' : 'text-gray-400'}`}><Icons.List className="w-5 h-5" /></button>
+                  </div>
+                </div>
+                {historyAssignments.length === 0 ? <EmptyState isHistory title="Archive Dry" desc="Completed objectives will materialize here for secure record-keeping." /> : (
+                  <div className="space-y-32 pb-40">
+                    {viewMode === 'grid' ? (
+                      historyGrouped.map(([subject, items]) => <SubjectSection key={subject} subject={subject} items={items} initialCollapsed={true} renderCard={(a) => <AssignmentCard key={a.id} assignment={a} settings={settings} currentGrades={currentGrades} isHistory onRemove={() => { if (settings.confirmDelete) setPendingDeleteId(a.id); else removeAssignment(a.id); }} onRestore={() => setAssignments(prev => prev.map(item => item.id === a.id ? { ...item, isCompleted: false, completedAt: undefined } : item))} reduceMotion={settings.reduceMotion} />} />)
+                    ) : (
+                      <AssignmentList assignments={historyAssignments} isHistory />
+                    )}
+                  </div>
+                )}
+              </motion.div>}
+              {activeTab === 'leaderboard' && <motion.div key="leaderboard" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20"><LeaderboardSection currentUser={userProfile} /></motion.div>}
+              {activeTab === 'grades' && <motion.div key="grades" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20"><GradesSection reduceMotion={settings.reduceMotion} activeAssignments={assignments.filter(a => !a.isCompleted)} /></motion.div>}
+              {activeTab === 'integrations' && <motion.div key="integrations" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20"><IntegrationsSection drive={drive} onOpenScraper={() => setIsScraperOpen(true)} /></motion.div>}
+              {activeTab === 'settings' && <motion.div key="settings" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20"><SettingsSection settings={settings} onUpdate={updateSetting} onClearAll={() => setIsClearAllModalOpen(true)} onSignOut={() => setIsSignOutModalOpen(true)} onRestartTour={() => { setShowTour(true); updateSetting('tourCompleted', false); updateSetting('selectedClass', undefined); }} /></motion.div>}
+              {activeTab === 'pulse' && <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full"><PulseSection messages={pulseMessages} setMessages={setPulseMessages} protocol={pulseProtocol} setProtocol={setPulseProtocol} strategy={pulseStrategy} setStrategy={setPulseStrategy} intelligence={pulseIntelligence} setIntelligence={setPulseIntelligence} activeAssignment={assignments.find(a => a.id === activeAssignmentId) || null} allAssignments={assignments.filter(a => !a.isCompleted)} onClearContext={() => setActiveAssignmentId(null)} onSelectAssignment={setActiveAssignmentId} setActiveTab={setActiveTab} onXPEarned={earnXP} reduceMotion={settings.reduceMotion} drive={drive} /></motion.div>}
+              {activeTab === 'simulator' && <motion.div key="simulator" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="h-full overflow-y-auto px-4 sm:px-6 lg:px-12 xl:px-20 py-8 sm:py-12 lg:py-20 max-w-7xl mx-auto"><SimulatorSection simulationMode={simMode} setSimulationMode={setSimMode} selectedSubject={simSubject} setSelectedSubject={setSimSubject} category={simCategory} setCategory={setSimCategory} numToSimulate={simNumToSimulate} setNumToSimulate={setSimNumToSimulate} itemCount={simItemCount} setItemCount={setSimItemCount} hypotheticalScore={simHypotheticalScore} setHypotheticalScore={setSimHypotheticalScore} /></motion.div>}
+            </AnimatePresence>
+          </main>
+        </div>
+        <UndoToast visible={!!undoItem} onUndo={handleUndo} />
+        <AnimatePresence>
+          {showTour && <OnboardingTour reduceMotion={settings.reduceMotion} onComplete={() => { setShowTour(false); updateSetting('tourCompleted', true); if (!settings.selectedClass) setShowClassSelector(true); }} />}
+          {showClassSelector && <ClassSelectionModal onSelect={handleClassSelection} />}
+          {showMandatoryPortalSetup && <MandatoryPortalSetupModal onComplete={handleMandatoryPortalSetup} />}
+          {showFirstSyncPrompt && <FirstSyncModal
+            onClose={() => setShowFirstSyncPrompt(false)}
+            onConfirm={() => {
+              setShowFirstSyncPrompt(false);
+              setActiveTab('grades');
+              playUISound('action');
+            }}
+          />}
+          {isModalOpen && <AssignmentModal drive={drive} initialAssignment={editingAssignment || undefined} onClose={() => { setIsModalOpen(false); setEditingAssignment(null); }} onSave={editingAssignment ? updateAssignment : addAssignment} reduceMotion={settings.reduceMotion} />}
+          {isScraperOpen && <HomeworkScraperModal isOpen={isScraperOpen} onClose={() => setIsScraperOpen(false)} reduceMotion={settings.reduceMotion} onImport={addAssignments} />}
+          <ConfirmModal isOpen={isSignOutModalOpen} onClose={() => setIsSignOutModalOpen(false)} onConfirm={handleSignOutConfirmed} title="Terminate?" description="End secure session and return to entry protocol?" confirmLabel="Terminate" reduceMotion={settings.reduceMotion} />
+          <ConfirmModal isOpen={isClearAllModalOpen} onClose={() => setIsClearAllModalOpen(false)} onConfirm={() => { setAssignments([]); setUserProfile(p => ({ ...p, xp: 0 })); playUISound('action'); }} title="Purge Records?" description="Irreversible removal of all stored tactical objectives and XP." confirmLabel="Purge" variant="danger" reduceMotion={settings.reduceMotion} />
+          <ConfirmModal isOpen={isClearBoardModalOpen} onClose={() => setIsClearBoardModalOpen(false)} onConfirm={() => { setAssignments([]); playUISound('action'); }} title="Clear Board?" description="This will irreversibly remove all active and archived objectives. XP will be retained." confirmLabel="Purge Board" variant="danger" reduceMotion={settings.reduceMotion} />
+          <ConfirmModal isOpen={!!pendingDeleteId} onClose={() => setPendingDeleteId(null)} onConfirm={() => pendingDeleteId && removeAssignment(pendingDeleteId)} title="Scrub Entry?" description="Objective will be removed from system board." confirmLabel="Scrub" variant="danger" reduceMotion={settings.reduceMotion} />
+          {isPortalSubmitOpen && <PortalSubmitModal isOpen={isPortalSubmitOpen} onClose={() => setIsPortalSubmitOpen(false)} assignment={submittingAssignment} reduceMotion={settings.reduceMotion} onNavigateToSettings={() => setActiveTab('settings')} onSuccessfulSubmit={handleSuccessfulPortalSubmit} />}
+          {isBulkSubmitOpen && <BulkSubmitModal isOpen={isBulkSubmitOpen} onClose={() => setIsBulkSubmitOpen(false)} assignments={assignments.filter(a => !a.isCompleted)} onSuccessfulSubmit={handleSuccessfulPortalSubmit} />}
+          <InSessionModal
+            isOpen={showInSessionModal}
+            onClose={() => {
+              setShowInSessionModal(false);
+              dismissedSessionRef.current = normalizeSubject(currentSessionSubject);
+            }}
+            assignments={inSessionAssignments}
+            sessionSubject={currentSessionSubject}
+            onComplete={(id) => {
+              setAssignments(prev => prev.map(item => item.id === id ? { ...item, isCompleted: true, completedAt: Date.now() } : item));
+              setInSessionAssignments(prev => prev.filter(a => a.id !== id));
+              if (inSessionAssignments.length === 1) setShowInSessionModal(false);
+              earnXP(10);
+            }}
+            onPulse={(id) => {
+              const a = assignments.find(item => item.id === id);
+              if (a) handlePulseSelect(a);
+              setShowInSessionModal(false);
+              dismissedSessionRef.current = normalizeSubject(currentSessionSubject);
+            }}
+          />
+        </AnimatePresence>
+      </div>
+    </MotionConfig>
+  );
+};
+
+const MobileMenu: React.FC<{ isOpen: boolean; onClose: () => void; activeTab: Tab; setActiveTab: (tab: Tab) => void; settings: AppSettings; toggleTheme: () => void; hasActiveAssignments: boolean; }> = ({ isOpen, onClose, activeTab, setActiveTab, settings, toggleTheme, hasActiveAssignments }) => {
+  const tabs = [
+    { id: 'assignments', icon: Icons.Layout, label: 'Board' },
+    { id: 'history', icon: Icons.History, label: 'Archive' },
+    { id: 'grades', icon: Icons.Clipboard, label: 'Grades' },
+    { id: 'simulator', icon: Icons.Calculator, label: 'Simulator' },
+    { id: 'pulse', icon: Icons.Activity, label: 'Pulse' },
+    { id: 'leaderboard', icon: Icons.Trophy, label: 'Leaderboard' },
+    { id: 'integrations', icon: Icons.Link, label: 'Integrations' },
+    { id: 'settings', icon: Icons.Settings, label: 'Settings' }
+  ];
+
+  if (!isOpen) return null;
+
+  return createPortal(
+    <div className="fixed inset-0 z-[500] md:hidden">
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+        className="absolute inset-0 bg-black/80 backdrop-blur-xl"
+      />
+      <motion.div
+        initial={{ x: -300 }}
+        animate={{ x: 0 }}
+        exit={{ x: -300 }}
+        className="absolute left-0 top-0 bottom-0 w-80 max-w-[85vw] bg-white dark:bg-[#0d0d0d] border-r border-gray-100 dark:border-white/10 flex flex-col p-6 shadow-2xl"
+      >
+        <div className="h-20 flex items-center justify-between mb-8">
+          <div className="flex items-center gap-3">
+            <Icons.Flash className="w-8 h-8 text-black dark:text-white" />
+            <span className="font-bold tracking-tighter text-3xl">Flash.</span>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors">
+            <Icons.X className="w-6 h-6" />
+          </button>
+        </div>
+        <div className="flex-1 space-y-2 overflow-y-auto">
+          {tabs.map(tab => {
+            const isDisabled = tab.id === 'pulse' && !hasActiveAssignments;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => {
+                  if (isDisabled) {
+                    playUISound('error');
+                    return;
+                  }
+                  setActiveTab(tab.id as Tab);
+                  playUISound('action');
+                  onClose();
+                }}
+                className={`w-full flex items-center justify-between gap-4 px-6 py-4 rounded-2xl text-base font-bold transition-all ${activeTab === tab.id ? 'bg-black dark:bg-white text-white dark:text-black shadow-xl' : 'text-gray-400'} ${isDisabled ? 'opacity-40 cursor-not-allowed' : 'hover:text-gray-900 dark:hover:text-white active:scale-95'}`}
+                title={isDisabled ? 'Pulse AI requires active assignments' : undefined}
+              >
+                <div className="flex items-center gap-4">
+                  <tab.icon className="w-5 h-5" />
+                  <span>{tab.label}</span>
+                </div>
+                {isDisabled && <Icons.Lock className="w-4 h-4" />}
+              </button>
+            );
+          })}
+        </div>
+        <button
+          onClick={() => { toggleTheme(); playUISound('switch'); }}
+          className="mt-4 p-6 rounded-2xl bg-gray-50 dark:bg-white/5 text-gray-500 hover:text-black dark:hover:text-white transition-all flex items-center justify-center border border-transparent dark:border-white/5"
+        >
+          {settings.theme === 'dark' ? <Icons.Sun className="w-5 h-5" /> : <Icons.Moon className="w-5 h-5" />}
+        </button>
+      </motion.div>
+    </div>,
+    document.body
+  );
+};
+
+const Sidebar: React.FC<{ activeTab: Tab; setActiveTab: (tab: Tab) => void; settings: AppSettings; toggleTheme: () => void; hasActiveAssignments: boolean; }> = ({ activeTab, setActiveTab, settings, toggleTheme, hasActiveAssignments }) => {
+  const tabs = [
+    { id: 'assignments', icon: Icons.Layout, label: 'Board' },
+    { id: 'history', icon: Icons.History, label: 'Archive' },
+    { id: 'grades', icon: Icons.Clipboard, label: 'Grades', tourId: 'tour-grades-nav' },
+    { id: 'simulator', icon: Icons.Calculator, label: 'Simulator', tourId: 'tour-simulator-nav' },
+    { id: 'pulse', icon: Icons.Activity, label: 'Pulse', tourId: 'tour-pulse-nav' },
+    { id: 'leaderboard', icon: Icons.Trophy, label: 'Leaderboard' },
+    { id: 'integrations', icon: Icons.Link, label: 'Integrations' },
+    { id: 'settings', icon: Icons.Settings, label: 'Settings' }
+  ];
+
+  return (
+    <aside id="tour-sidebar" className="w-64 border-r border-gray-100 dark:border-white/5 flex-col p-6 bg-white dark:bg-[#0d0d0d] hidden lg:flex transition-colors duration-500 shadow-2xl relative z-50">
+      <div className="h-24 flex items-center gap-3 mb-12"><Icons.Flash className="w-8 h-8 text-black dark:text-white" /><span className="font-bold tracking-tighter text-3xl">Flash.</span></div>
+      <div className="flex-1 space-y-4">
+        {tabs.map(tab => {
+          const isDisabled = tab.id === 'pulse' && !hasActiveAssignments;
+          return (
+            <button
+              key={tab.id}
+              id={tab.tourId}
+              onClick={() => {
+                if (isDisabled) {
+                  playUISound('error');
+                  return;
+                }
+                setActiveTab(tab.id as Tab); playUISound('action');
+              }}
+              className={`w-full flex items-center justify-between gap-4 px-6 py-5 rounded-[2rem] text-sm font-bold transition-all ${activeTab === tab.id ? 'bg-black dark:bg-white text-white dark:text-black shadow-xl' : 'text-gray-400'} ${isDisabled ? 'opacity-40 cursor-not-allowed' : 'hover:text-gray-900 dark:hover:text-white'}`}
+              title={isDisabled ? 'Pulse AI requires active assignments. Add an objective on the board to activate.' : undefined}
+            >
+              <div className="flex items-center gap-4">
+                <tab.icon className="w-5 h-5" />
+                <span>{tab.label}</span>
+              </div>
+              {isDisabled && <Icons.Lock className="w-4 h-4" />}
+            </button>
+          );
+        })}
+      </div>
+      <button onClick={() => { toggleTheme(); playUISound('switch'); }} className="p-6 rounded-[2.5rem] bg-gray-50 dark:bg-white/5 text-gray-500 hover:text-black dark:hover:text-white transition-all flex items-center justify-center border border-transparent dark:border-white/5">{settings.theme === 'dark' ? <Icons.Sun className="w-5 h-5" /> : <Icons.Moon className="w-5 h-5" />}</button>
+    </aside>
+  );
+};
+
+const SessionTracker: React.FC<{ selectedClass?: UserClass }> = ({ selectedClass }) => {
+  const [session, setSession] = useState(getCurrentAndNextSession(selectedClass));
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSession(getCurrentAndNextSession(selectedClass));
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [selectedClass]);
+
+  return (
+    <div className="flex items-center gap-6 px-6 py-2.5 bg-gray-50 dark:bg-white/5 border border-gray-100 dark:border-white/10 rounded-full">
+      <div className="flex flex-col">
+        <span className="text-[9px] font-black uppercase tracking-[0.2em] text-gray-400">Current Protocol</span>
+        <div className="flex items-center gap-2">
+          {session.type === 'block' && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 bg-blue-500/10 rounded-full">
+              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)] animate-pulse" />
+              <span className="text-[8px] font-black text-blue-500 uppercase tracking-widest">Block</span>
+            </div>
+          )}
+          <span className="text-xs font-bold text-gray-900 dark:text-white uppercase truncate max-w-[120px]">{session.current}</span>
+        </div>
+      </div>
+      <div className="w-px h-6 bg-gray-200 dark:bg-white/10" />
+      <div className="flex flex-col">
+        <span className="text-[9px] font-black uppercase tracking-[0.2em] text-gray-400">Next Signal</span>
+        <span className="text-xs font-bold text-gray-500 uppercase">{session.next}</span>
+      </div>
+    </div>
+  );
+};
+
+const Header: React.FC<{ settings: AppSettings; toggleTheme: () => void; userProfile: UserProfile; xpChange: number | null; onMenuClick: () => void }> = ({ settings, toggleTheme, userProfile, xpChange, onMenuClick }) => (
+  <header className="h-16 sm:h-20 lg:h-24 px-4 sm:px-6 lg:px-12 flex items-center justify-between bg-white dark:bg-[#0d0d0d]/40 backdrop-blur-3xl border-b border-gray-100 dark:border-white/5 transition-colors duration-500 relative z-10 shrink-0">
+    <button onClick={onMenuClick} className="p-2 lg:hidden hover:bg-gray-100 dark:hover:bg-white/5 rounded-xl transition-colors">
+      <Icons.Menu className="w-6 h-6" />
+    </button>
+    <div className="flex items-center gap-2 lg:hidden"><Icons.Flash className="w-5 h-5 sm:w-6 sm:h-6" /><span className="font-bold tracking-tighter text-xl sm:text-2xl">Flash.</span></div>
+    <div className="hidden lg:flex items-center gap-4 xl:gap-8 ml-auto">
+      <SessionTracker selectedClass={settings.selectedClass} />
+      <a href="https://plusportals.com/GPSchool" target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-5 py-2.5 bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 rounded-full hover:bg-blue-500/10 hover:text-blue-500 transition-all text-gray-500 group"><Icons.Link className="w-4 h-4 transition-transform group-hover:-rotate-12" /><span className="text-[10px] font-black uppercase tracking-[0.2em]">Open Portal</span></a>
+      <div className="flex items-center gap-4 group" id="tour-pulse-status"><div className="flex flex-col items-end"><span className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400">Tactical Status</span><div className="flex items-center gap-2"><span className="text-sm font-bold text-gray-900 dark:text-white tabular-nums">{userProfile.xp.toLocaleString()} XP</span><AnimatePresence>{xpChange && <motion.span initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="text-[10px] font-bold text-blue-500">+{xpChange}</motion.span>}</AnimatePresence></div></div><div className="w-10 h-10 rounded-full bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 flex items-center justify-center"><Icons.Activity className="w-4 h-4 text-gray-400" /></div></div>
+    </div>
+    <button onClick={() => { toggleTheme(); playUISound('switch'); }} className="p-2 lg:hidden"><Icons.Moon className="w-5 h-5 sm:w-6 sm:h-6" /></button>
+  </header>
+);
+
+const AssignmentModal: React.FC<{ drive: ReturnType<typeof useGoogleDrive>; initialAssignment?: Assignment; onClose: () => void; onSave: (a: Assignment) => void; reduceMotion: boolean }> = ({ drive, initialAssignment, onClose, onSave, reduceMotion }) => {
+  const [tab, setTab] = useState<ModalTab>('manual'); const [subject, setSubject] = useState(initialAssignment?.subject || ''); const [title, setTitle] = useState(initialAssignment?.title || ''); const [dueDate, setDueDate] = useState(initialAssignment?.dueDate || ''); const [weight, setWeight] = useState(initialAssignment?.weight?.toString() || '10'); const [status, setStatus] = useState<'idle' | 'syncing' | 'ready'>('idle');
+  const [attachments, setAttachments] = useState<Attachment[]>(initialAssignment?.richAttachments || []);
+  const [showAttachMenu, setShowAttachMenu] = useState(false); const fileRef = useRef<HTMLInputElement>(null); const cameraRef = useRef<HTMLInputElement>(null);
+
+  const handleManualSubmit = async (e: React.FormEvent) => { e.preventDefault(); if (!title || !subject) return playUISound('error'); setStatus('syncing'); playUISound('action'); await new Promise(r => setTimeout(r, 600)); onSave({ id: initialAssignment?.id || Math.random().toString(36).substr(2, 9), subject: normalizeSubject(subject), title, dueDate, weight: parseFloat(weight) || 10, richAttachments: attachments, isCompleted: initialAssignment?.isCompleted || false, completedAt: initialAssignment?.completedAt }); playUISound('success'); setStatus('ready'); };
+  const handleAIImport = async (e: React.ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; if (!file) return; setStatus('syncing'); playUISound('action'); const reader = new FileReader(); reader.onloadend = async () => { try { const base64 = (reader.result as string).split(',')[1]; const res = await extractAssignmentsFromImage(base64, file.type); if (res && Array.isArray(res)) { res.forEach(item => onSave({ id: Math.random().toString(36).substr(2, 9), subject: normalizeSubject(item.subject), title: item.title, dueDate: item.due_date, weight: 10 })); playUISound('success'); } else playUISound('error'); } catch (err) { playUISound('error'); } finally { setStatus('idle'); onClose(); } }; reader.readAsDataURL(file); };
+
+  const handleFileAttachment = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files) {
+      const newFiles: Attachment[] = [];
+      for (const f of Array.from(files) as File[]) {
+        let extractedText = '';
+        if (f.name.toLowerCase().endsWith('.docx')) {
+          try {
+            const arrayBuffer = await f.arrayBuffer();
+            const result = await mammoth.extractRawText({ arrayBuffer });
+            extractedText = result.value;
+          } catch (err) {
+            console.error("Extraction error:", err);
+          }
+        } else if (f.name.toLowerCase().endsWith('.pdf')) {
+          try {
+            const arrayBuffer = await f.arrayBuffer();
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+            const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            let text = '';
+            for (let i = 1; i <= pdf.numPages; i++) {
+              const page = await pdf.getPage(i);
+              const content = await page.getTextContent();
+              text += content.items.map((item: any) => item.str).join(' ') + '\n';
+            }
+            extractedText = text;
+          } catch (err) {
+            console.error("PDF Extraction error:", err);
+          }
+        }
+        newFiles.push({ name: f.name, type: 'file', extractedText });
+      }
+      setAttachments(prev => [...prev, ...newFiles]);
+      playUISound('action');
+    }
+    setShowAttachMenu(false);
+  };
+
+  const handleDriveAttachment = () => { drive.openPicker((selected) => { setAttachments(prev => [...prev, ...selected]); }); setShowAttachMenu(false); };
+  const removeAttachment = (index: number) => { setAttachments(prev => prev.filter((_, i) => i !== index)); playUISound('action'); };
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" />
+      <motion.div initial={{ opacity: 0, scale: 0.9, y: 30 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 30 }} className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[4.5rem] p-16 overflow-hidden border border-white/10 shadow-2xl">
+        <div className="flex items-center justify-between mb-12"><h2 className="text-4xl font-bold tracking-tighter">{initialAssignment ? 'Edit Objective.' : 'New Objective.'}</h2><button onClick={onClose} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full transition-colors"><Icons.X className="w-8 h-8" /></button></div>
+        {!initialAssignment && <div className="flex bg-gray-100 dark:bg-white/5 p-1.5 rounded-[2.5rem] mb-12 shadow-inner"><button onClick={() => { setTab('manual'); playUISound('action'); }} className={`flex-1 py-5 rounded-[2rem] text-sm font-bold transition-all ${tab === 'manual' ? 'bg-white dark:bg-white/10 text-black dark:text-white shadow-xl' : 'text-gray-400'}`}>Manual Entry</button><button onClick={() => { setTab('ai'); playUISound('action'); }} className={`flex-1 py-5 rounded-[2rem] text-sm font-bold transition-all ${tab === 'ai' ? 'bg-white dark:bg-white/10 text-black dark:text-white shadow-xl' : 'text-gray-400'}`}>AI Tactical Scan</button></div>}
+        {tab === 'manual' || initialAssignment ? (
+          <form onSubmit={handleManualSubmit} className="space-y-8">
+            <div className="grid grid-cols-3 gap-8">
+              <div className="col-span-1"><label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4 mb-2 block">Subject</label><input value={subject} onChange={e => setSubject(e.target.value)} placeholder="Subject" className="w-full bg-gray-50 dark:bg-white/5 border border-white/5 p-7 rounded-[2.5rem] outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium" /></div>
+              <div className="col-span-1"><label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4 mb-2 block">Due Date</label><input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} className="w-full bg-gray-50 dark:bg-white/5 border border-white/5 p-7 rounded-[2.5rem] outline-none text-lg font-medium" /></div>
+              <div className="col-span-1"><label className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4 mb-2 block">Weight (%)</label><input type="number" value={weight} onChange={e => setWeight(e.target.value)} placeholder="10" className="w-full bg-gray-50 dark:bg-white/5 border border-transparent dark:border-white/10 p-7 rounded-[2.5rem] outline-none text-lg font-medium" /></div>
+            </div>
+            <input value={title} onChange={e => setTitle(e.target.value)} placeholder="Objective Name (TermWeekSubjectTypeIndex)" className="w-full bg-gray-50 dark:bg-white/5 border border-white/5 p-7 rounded-[2.5rem] outline-none focus:ring-1 focus:ring-blue-500/30 text-lg font-medium" />
+            <div className="space-y-4"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><span className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-4">Reference Attachments</span></div><div className="relative"><button type="button" onClick={() => { setShowAttachMenu(!showAttachMenu); playUISound('action'); }} className="flex items-center gap-2 px-4 py-2 bg-gray-100 dark:bg-white/5 rounded-full text-[10px] font-bold uppercase tracking-widest text-blue-500 hover:opacity-80 transition-opacity"><Icons.Paperclip className="w-3 h-3" /><span>Add reference</span></button><AnimatePresence>{showAttachMenu && (<><div className="fixed inset-0 z-[140]" onClick={() => setShowAttachMenu(false)} /><motion.div initial={{ opacity: 0, scale: 0.9, y: 10 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 10 }} className="absolute bottom-12 right-0 w-52 bg-white dark:bg-[#1a1a1a] border border-gray-100 dark:border-white/10 rounded-2xl shadow-2xl p-2 z-[150]"><button type="button" onClick={() => { fileRef.current?.click(); setShowAttachMenu(false); }} className="flex items-center gap-3 w-full p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.File className="w-4 h-4 text-blue-500 opacity-60 group-hover:opacity-100" /><span className="text-[10px] font-bold uppercase tracking-widest">Local File</span></button><button type="button" onClick={handleDriveAttachment} className="flex items-center gap-3 w-full p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.FileText className="w-4 h-4 text-blue-600 opacity-60 group-hover:opacity-100" /><span className="text-[10px] font-bold uppercase tracking-widest">Google Drive</span></button><button type="button" onClick={() => { cameraRef.current?.click(); setShowAttachMenu(false); }} className="flex items-center gap-3 w-full p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.Camera className="w-4 h-4 text-amber-500 opacity-60 group-hover:opacity-100" /><span className="text-[10px] font-bold uppercase tracking-widest">Take Photo</span></button></motion.div></>)}</AnimatePresence></div></div><div className="flex flex-wrap gap-2 px-4">{attachments.map((att, i) => (<div key={i} className="flex items-center gap-2 bg-gray-100 dark:bg-white/5 px-3 py-1.5 rounded-lg border border-transparent dark:border-white/5 group"><div className="w-3 h-3 text-gray-400">{att.type === 'drive' ? <Icons.FileText className="w-full h-full text-blue-500" /> : <Icons.File className="w-full h-full" />}</div><span className="text-[10px] font-medium text-gray-600 dark:text-gray-300 truncate max-w-[120px]">{att.name}</span><button type="button" onClick={() => removeAttachment(i)} className="text-gray-400 hover:text-rose-500 transition-colors"><Icons.X className="w-3 h-3" /></button></div>))}</div></div>
+            <button disabled={status === 'syncing'} className="w-full py-8 rounded-[3rem] bg-black dark:bg-white text-white dark:text-black font-bold uppercase tracking-[0.2em] shadow-2xl active:scale-95 transition-all text-sm">{status === 'syncing' ? "Syncing Logic..." : initialAssignment ? "Update Objective" : "Lock in objective"}</button>
+            <input type="file" ref={fileRef} hidden multiple onChange={handleFileAttachment} /><input type="file" ref={cameraRef} hidden accept="image/*" capture="environment" onChange={handleFileAttachment} />
+          </form>
+        ) : (
+          <div className="py-12 text-center space-y-12"><Icons.Sparkles className="w-20 h-20 mx-auto text-blue-500 opacity-40 animate-pulse" /><div className="space-y-4"><p className="text-xl font-bold">Scanning Protocol</p><p className="text-gray-500 font-medium max-w-sm mx-auto">Upload school portal screenshots for instant objective tracking.</p></div><input type="file" ref={fileRef} onChange={handleAIImport} hidden accept="image/*" /><button onClick={() => fileRef.current?.click()} disabled={status === 'syncing'} className="w-full py-8 rounded-[3rem] bg-blue-600 text-white font-bold uppercase tracking-[0.2em] shadow-xl shadow-blue-500/30 active:scale-95 transition-all">{status === 'syncing' ? "Calibrating Sensors..." : "Select Screenshot"}</button></div>
+        )}
+      </motion.div>
+    </div>
+  );
+};
+
+const ConfirmModal: React.FC<{ isOpen: boolean; onClose: () => void; onConfirm: () => void; title: string; description: string; confirmLabel?: string; variant?: 'danger' | 'primary'; reduceMotion: boolean }> = ({ isOpen, onClose, onConfirm, title, description, confirmLabel = 'Confirm', variant = 'primary', reduceMotion }) => {
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        onConfirm();
+        onClose();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onConfirm, onClose]);
+
+  return (
+    <AnimatePresence>
+      {isOpen && <div className="fixed inset-0 z-[110] flex items-center justify-center p-6"><motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-black/85 backdrop-blur-3xl" /><motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="relative w-full max-w-md bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-14 text-center border border-white/5 shadow-2xl"><h2 className="text-4xl font-bold tracking-tighter mb-4">{title}</h2><p className="text-gray-500 font-medium mb-12 leading-relaxed text-lg">{description}</p><div className="flex gap-5"><button onClick={onClose} className="flex-1 py-6 rounded-2xl bg-gray-100 dark:bg-white/5 text-gray-500 font-bold uppercase tracking-widest text-sm">Cancel</button><button onClick={() => { onConfirm(); onClose(); }} className={`flex-1 py-6 rounded-2xl font-bold uppercase tracking-widest text-white text-sm shadow-xl ${variant === 'danger' ? 'bg-rose-600 shadow-rose-500/20' : 'bg-black dark:bg-white dark:text-black shadow-white/10'}`}>{confirmLabel}</button></div></motion.div></div>}
+    </AnimatePresence>
+  );
+};
+
+const PulseSection: React.FC<{ messages: PulseMessage[]; setMessages: React.Dispatch<React.SetStateAction<PulseMessage[]>>; protocol: PulseMode; setProtocol: (p: PulseMode) => void; strategy: Strategy; setStrategy: (s: Strategy) => void; intelligence: Intelligence; setIntelligence: (i: Intelligence) => void; activeAssignment: Assignment | null; allAssignments: Assignment[]; onClearContext: () => void; onSelectAssignment: (id: string) => void; setActiveTab: (tab: Tab) => void; onXPEarned: (amount: number) => void; reduceMotion: boolean; drive: ReturnType<typeof useGoogleDrive>; }> = ({ messages, setMessages, protocol, setProtocol, strategy, setStrategy, intelligence, setIntelligence, activeAssignment, allAssignments, onClearContext, onSelectAssignment, setActiveTab, onXPEarned, reduceMotion, drive }) => {
+  const [input, setInput] = useState(''); const [isLoading, setIsLoading] = useState(false); const [attachedImage, setAttachedImage] = useState<string | null>(null); const [attachedFile, setAttachedFile] = useState<PulseMessage['file'] | null>(null); const [showAttachMenu, setShowAttachMenu] = useState(false); const [showPasteModal, setShowPasteModal] = useState(false); const [copiedId, setCopiedId] = useState<number | null>(null); const [localError, setLocalError] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [showDailyBriefing, setShowDailyBriefing] = useState(false);
+  const [uploadingWord, setUploadingWord] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadedWordDoc, setUploadedWordDoc] = useState<{ url: string; name: string; size: number } | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [interimTranscript, setInterimTranscript] = useState('');
+  const recognitionRef = useRef<any>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [showCameraModal, setShowCameraModal] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const assignmentsDueSoon = useMemo(() =>
+    allAssignments.filter(a => !a.isCompleted && a.dueDate && (isDateToday(a.dueDate) || isDateTomorrow(a.dueDate))),
+    [allAssignments]
+  );
+
+  const lastPulseTime = useRef<number>(0); const scrollRef = useRef<HTMLDivElement>(null); const fileRef = useRef<HTMLInputElement>(null); const cameraRef = useRef<HTMLInputElement>(null);
+
+  const handleDailyBriefingSelect = (id: string) => {
+    onSelectAssignment(id);
+    setShowDailyBriefing(false);
+    localStorage.setItem('flash-last-pulse-visit', new Date().toDateString());
+    playUISound('action');
+  };
+
+  const handleDailyBriefingDismiss = () => {
+    setShowDailyBriefing(false);
+    localStorage.setItem('flash-last-pulse-visit', new Date().toDateString());
+    playUISound('switch');
+  };
+
+  useEffect(() => {
+    const today = new Date().toDateString();
+    const lastVisit = localStorage.getItem('flash-last-pulse-visit');
+    const lastRefreshTimestamp = localStorage.getItem('flash-tactical-refresh-timestamp');
+
+    // Check if tactical refresh happened recently (within last 10 seconds)
+    const shouldShowRefreshBriefing = lastRefreshTimestamp &&
+      (Date.now() - parseInt(lastRefreshTimestamp)) < 10000;
+
+    if (shouldShowRefreshBriefing && assignmentsDueSoon.length > 0) {
+      // Clear the timestamp and show visual briefing
+      localStorage.removeItem('flash-tactical-refresh-timestamp');
+      setShowDailyBriefing(true);
+    } else if (lastVisit !== today && assignmentsDueSoon.length > 0) {
+      // Only show once per day
+      setShowDailyBriefing(true);
+    }
+  }, [assignmentsDueSoon]);
+
+  // Listen for tactical refresh completion to show briefing
+  useEffect(() => {
+    const handleShowBriefing = () => {
+      if (assignmentsDueSoon.length > 0) {
+        setShowDailyBriefing(true);
+      }
+    };
+
+    window.addEventListener('show-pulse-briefing', handleShowBriefing);
+    return () => window.removeEventListener('show-pulse-briefing', handleShowBriefing);
+  }, [assignmentsDueSoon]);
+
+  useEffect(() => {
+    // Only generate AI briefing if there are no assignments due soon AND no existing messages
+    if (messages.length === 0 && !showDailyBriefing && assignmentsDueSoon.length === 0) {
+      // Regular initial briefing
+      setIsLoading(true);
+      const briefingMsg: PulseMessage = { role: 'user', content: "Provide tactical briefing for active objectives today." };
+      getPulseResponse([briefingMsg], protocol, strategy, intelligence, undefined, allAssignments)
+        .then(briefingResponse => {
+          setMessages([{ role: 'model', content: briefingResponse.text || "Tactical surface clear for today.", sources: briefingResponse.sources }]);
+        })
+        .catch(err => console.error("Briefing failed:", err))
+        .finally(() => setIsLoading(false));
+    }
+  }, [activeAssignment?.id, strategy, intelligence, allAssignments, setMessages, messages.length, protocol, showDailyBriefing, assignmentsDueSoon]);
+
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, isLoading]);
+
+  const handleSend = async () => {
+    if (!input.trim() && !attachedImage && !attachedFile && !uploadedWordDoc) return;
+    setLocalError(null);
+
+    // Add Word document URL to message content if present
+    let messageContent = input;
+    if (uploadedWordDoc) {
+      messageContent = messageContent
+        ? `${messageContent}\n\n📎 ${uploadedWordDoc.name}`
+        : `📎 ${uploadedWordDoc.name}`;
+    }
+
+    const userMsg: PulseMessage = { role: 'user', content: messageContent, image: attachedImage || undefined, file: attachedFile || undefined };
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages); setInput(''); setAttachedImage(null); setAttachedFile(null); setUploadedWordDoc(null); setIsLoading(true); playUISound('action');
+    try {
+      let assignmentContext = activeAssignment ? `Focused Assignment: [${activeAssignment.subject}] ${activeAssignment.title}` : undefined;
+      if (activeAssignment?.richAttachments) {
+        const attachmentTexts = activeAssignment.richAttachments
+          .filter(a => a.extractedText)
+          .map(a => `[CONTENT FROM ATTACHMENT ${a.name}]:\n${a.extractedText}`)
+          .join('\n\n');
+        if (attachmentTexts && assignmentContext) {
+          assignmentContext += `\n\nSupporting Materials:\n${attachmentTexts}`;
+        }
+      }
+      const response = await getPulseResponse(newMessages, protocol, strategy, intelligence, assignmentContext, allAssignments);
+      setMessages(prev => [...prev, { role: 'model', content: response.text || "Analysis failed.", strategy, intelligence, sources: response.sources }]);
+      const now = Date.now(); if (now - lastPulseTime.current > 10000) { onXPEarned(1); lastPulseTime.current = now; } playUISound('success');
+    } catch (err) {
+      setLocalError("Protocol failure. System logic reset.");
+      setAttachedImage(null); setAttachedFile(null);
+      playUISound('error');
+    } finally { setIsLoading(false); }
+  };
+
+  const processFile = async (file: File) => {
+    // Handle Word documents (.doc and .docx) - upload to Google Cloud Storage
+    const ext = file.name.toLowerCase();
+    if (ext.endsWith('.doc') || ext.endsWith('.docx')) {
+      try {
+        setUploadingWord(true);
+        setLocalError(null);
+        playUISound('action');
+
+        const result = await uploadWordDocument(file, (progress) => {
+          setUploadProgress(progress);
+        });
+
+        setUploadedWordDoc({
+          url: result.url,
+          name: result.originalName,
+          size: result.size
+        });
+
+        playUISound('success');
+        setShowAttachMenu(false);
+      } catch (err: any) {
+        console.error('Word upload error:', err);
+        setLocalError(err.message || 'Word document upload failed');
+        playUISound('error');
+      } finally {
+        setUploadingWord(false);
+        setUploadProgress(0);
+      }
+      return;
+    }
+
+    // Handle PDF files
+    if (file.name.toLowerCase().endsWith('.pdf')) {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const arrayBuffer = e.target?.result as ArrayBuffer;
+        try {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+          const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          let text = '';
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const content = await page.getTextContent();
+            text += content.items.map((item: any) => item.str).join(' ') + '\n';
+          }
+          setInput(prev => prev ? `${prev}\n\n[ATTACHED PDF]:\n${text}` : `[ATTACHED PDF]:\n${text}`);
+          playUISound('success');
+        } catch (err) {
+          setLocalError("PDF extraction failed.");
+          playUISound('error');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+      setShowAttachMenu(false);
+      return;
+    }
+
+    // Handle image files
+    const supported = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword'];
+    if (!supported.includes(file.type)) {
+      setLocalError("Material restricted. Protocol supports Images, PDFs, DOC and DOCX.");
+      playUISound('error');
+      setShowAttachMenu(false);
+      return;
+    }
+    setLocalError(null);
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64Data = (reader.result as string).split(',')[1];
+      if (file.type.startsWith('image/')) { setAttachedImage(reader.result as string); setAttachedFile(null); }
+      else { setAttachedFile({ data: base64Data, mimeType: file.type, name: file.name }); setAttachedImage(null); }
+    };
+    reader.readAsDataURL(file);
+  };
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; if (file) processFile(file); setShowAttachMenu(false); };
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
+  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); };
+  const handleDrop = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); const file = e.dataTransfer.files?.[0]; if (file) processFile(file); };
+  const handlePasteText = (text: string) => { if (text.trim()) { setInput(prev => prev ? `${prev}\n\n[PASTED CONTEXT]:\n${text}` : `[PASTED CONTEXT]:\n${text}`); playUISound('action'); } };
+  const handleNewChat = () => { setMessages([]); playUISound('switch'); setLocalError(null); };
+  const handleCopy = (content: string, index: number) => { navigator.clipboard.writeText(content); setCopiedId(index); playUISound('action'); setTimeout(() => setCopiedId(null), 2000); };
+
+  // Camera handlers
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      playUISound('action');
+    } catch (err) {
+      console.error('Camera error:', err);
+      setLocalError('Camera access denied. Please enable camera permissions.');
+      playUISound('error');
+      setShowCameraModal(false);
+    }
+  };
+
+  const capturePhoto = () => {
+    if (videoRef.current && canvasRef.current) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(video, 0, 0);
+        canvas.toBlob((blob) => {
+          if (blob) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              setAttachedImage(reader.result as string);
+              stopCamera();
+              setShowCameraModal(false);
+              playUISound('success');
+            };
+            reader.readAsDataURL(blob);
+          }
+        }, 'image/jpeg', 0.9);
+      }
+    }
+  };
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  };
+
+  const handleOpenCamera = () => {
+    setShowCameraModal(true);
+    setShowAttachMenu(false);
+  };
+
+  useEffect(() => {
+    if (showCameraModal) {
+      startCamera();
+    }
+    return () => {
+      stopCamera();
+    };
+  }, [showCameraModal]);
+
+  // Voice dictation setup and handlers
+  useEffect(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event: any) => {
+        let interim = '';
+        let final = '';
+
+        // Clear any existing silence timer when we receive new speech
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+        }
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            final += transcript;
+          } else {
+            interim += transcript;
+          }
+        }
+
+        if (final) {
+          setInput(prev => prev ? `${prev} ${final}` : final);
+          setInterimTranscript('');
+
+          // Start silence timer - auto-stop after 2 seconds of no speech
+          silenceTimerRef.current = setTimeout(() => {
+            if (recognitionRef.current && isRecording) {
+              recognitionRef.current.stop();
+              playUISound('switch');
+            }
+          }, 2000);
+        } else {
+          setInterimTranscript(interim);
+
+          // Also set timer for interim results
+          silenceTimerRef.current = setTimeout(() => {
+            if (recognitionRef.current && isRecording) {
+              recognitionRef.current.stop();
+              playUISound('switch');
+            }
+          }, 2000);
+        }
+      };
+
+
+      recognition.onerror = (event: any) => {
+        console.error('Speech recognition error:', event.error);
+        if (event.error === 'not-allowed') {
+          setLocalError('Microphone access denied. Please enable in browser settings.');
+        } else if (event.error === 'no-speech') {
+          setLocalError('No speech detected. Try speaking closer to the microphone.');
+        } else if (event.error === 'network') {
+          setLocalError('Network error. Voice input requires an internet connection.');
+        } else if (event.error === 'aborted') {
+          // Just clear the recording state, don't show error (user manually stopped)
+          setIsRecording(false);
+          setInterimTranscript('');
+          return;
+        } else {
+          setLocalError(`Voice input failed: ${event.error}. Please try again.`);
+        }
+        setIsRecording(false);
+        setInterimTranscript('');
+        playUISound('error');
+      };
+
+      recognition.onend = () => {
+        setIsRecording(false);
+        setInterimTranscript('');
+      };
+
+      recognitionRef.current = recognition;
+    }
+  }, []);
+
+  const handleStartDictation = () => {
+    if (!recognitionRef.current) {
+      setLocalError('Voice input not supported in this browser. Try Chrome or Safari.');
+      playUISound('error');
+      return;
+    }
+
+    try {
+      recognitionRef.current.start();
+      setIsRecording(true);
+      setLocalError(null);
+      playUISound('action');
+    } catch (err) {
+      console.error('Failed to start recognition:', err);
+      setLocalError('Failed to start voice input. Please try again.');
+      playUISound('error');
+    }
+  };
+
+  const handleStopDictation = () => {
+    if (recognitionRef.current) {
+      // Clear silence timer
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+
+      recognitionRef.current.stop();
+      setIsRecording(false);
+      setInterimTranscript('');
+      playUISound('switch');
+    }
+  };
+
+  const toggleDictation = () => {
+    if (isRecording) {
+      handleStopDictation();
+    } else {
+      handleStartDictation();
+    }
+  };
+
+  const PROTOCOL_STYLES: Record<string, { active: string, hover: string, text: string }> = {
+    general: { active: 'bg-blue-600 text-white', hover: 'group-hover:bg-blue-500/10', text: 'text-blue-500' },
+    lens: { active: 'bg-teal-600 text-white', hover: 'group-hover:bg-teal-500/10', text: 'text-teal-500' },
+    framework: { active: 'bg-emerald-600 text-white', hover: 'group-hover:bg-emerald-500/10', text: 'text-emerald-500' },
+    interpret: { active: 'bg-amber-600 text-white', hover: 'group-hover:bg-amber-500/10', text: 'text-amber-500' },
+    saqr: { active: 'bg-red-700 text-white', hover: 'group-hover:bg-red-700/10', text: 'text-red-600' },
+  };
+
+  const PulseSidebarButton: React.FC<{ id: PulseMode, label: string, icon: React.ElementType, desc: string }> = ({ id, label, icon: Icon, desc }) => {
+    const styles = PROTOCOL_STYLES[id] || PROTOCOL_STYLES.general;
+    const isActive = protocol === id;
+    return (
+      <button onClick={() => { setProtocol(id); playUISound('switch'); }} className={`w-full text-left p-6 rounded-[2rem] transition-all group flex gap-4 border border-transparent ${isActive ? 'bg-white dark:bg-white/5 border-gray-100 dark:border-white/10 shadow-lg' : 'hover:bg-gray-50 dark:hover:bg-white/5 opacity-60 hover:opacity-100'}`}>
+        <div className={`shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center transition-all ${isActive ? styles.active : `bg-gray-100 dark:bg-white/10 ${styles.hover}`}`}>
+          <Icon className={`w-6 h-6 ${!isActive ? styles.text : ''}`} />
+        </div>
+        <div className="min-w-0">
+          <p className="font-bold text-sm tracking-tight">{label}</p>
+          <p className="text-[10px] font-medium text-gray-500 truncate">{desc}</p>
+        </div>
+      </button>
+    );
+  };
+
+  return (
+    <div className="h-full flex bg-white dark:bg-[#080808]">
+      <div className="w-80 border-r border-gray-100 dark:border-white/5 flex flex-col p-6 space-y-3 shrink-0"><div className="px-4 pb-3 flex items-center justify-between"><div><h2 className="text-xl font-bold tracking-tighter">AI Protocols.</h2><p className="text-xs font-medium text-gray-400">Select domain matrix.</p></div><button onClick={handleNewChat} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-2xl transition-all text-gray-400 hover:text-blue-500 group" title="New Chat"><Icons.Restore className="w-5 h-5 transition-transform group-hover:-rotate-180 duration-500" /></button></div><PulseSidebarButton id="general" label="General" icon={Icons.Brain} desc="General-purpose reasoning and assistance." /><PulseSidebarButton id="lens" label="Lens" icon={Icons.Glasses} desc="Social Studies analysis matrix." /><PulseSidebarButton id="framework" label="Framework" icon={Icons.Dna} desc="Biology domain logic." /><PulseSidebarButton id="interpret" label="Interpret" icon={Icons.BookOpen} desc="English drafting engine." /><PulseSidebarButton id="saqr" label="صقر" icon={Icons.Eagle} desc="Arabic & Islamic specialized module." /><div className="mt-auto p-4 opacity-30"><p className="text-[10px] font-bold uppercase tracking-widest">Protocol 0.9.5</p></div></div>
+      <div className="flex-1 flex flex-col min-w-0 relative" onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+        <AnimatePresence>
+          {isDragging && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 z-[160] bg-blue-500/10 backdrop-blur-sm flex flex-col items-center justify-center border-4 border-dashed border-blue-500/30 m-4 rounded-[4rem] pointer-events-none">
+              <div className="bg-white dark:bg-[#0d0d0d] p-10 rounded-[3rem] shadow-2xl flex flex-col items-center gap-6">
+                <Icons.Upload className="w-16 h-16 text-blue-500 animate-bounce" />
+                <p className="text-2xl font-bold tracking-tighter">Release to Inject Material</p>
+                <p className="text-gray-400 text-sm font-bold uppercase tracking-widest">Images, PDFs or DOCX supported</p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence mode="wait">
+          {showDailyBriefing ? (
+            <motion.div key="briefing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full flex flex-col items-center justify-center p-6 sm:p-10 overflow-y-auto">
+              <div className="text-center mb-8 sm:mb-12">
+                <h2 className="text-4xl sm:text-5xl font-bold tracking-tighter">Today's Tactical Objectives.</h2>
+                <p className="text-gray-500 font-medium text-base sm:text-lg mt-2">Select an assignment to activate Pulse intelligence.</p>
+              </div>
+              <div className="w-full max-w-2xl space-y-8">
+                {(() => {
+                  const dueToday = assignmentsDueSoon.filter(a => isDateToday(a.dueDate));
+                  const dueTomorrow = assignmentsDueSoon.filter(a => isDateTomorrow(a.dueDate));
+
+                  return (
+                    <>
+                      {/* Due Today Section */}
+                      {dueToday.length > 0 && (
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                            <h3 className="text-sm font-bold uppercase tracking-widest text-amber-500">Due Today — {dueToday.length}</h3>
+                          </div>
+                          <div className="space-y-3">
+                            {dueToday.map((a, idx) => {
+                              const SubjectIcon = getSubjectIcon(a.subject);
+                              const gradeImpact = getGradeImpact(a);
+                              return (
+                                <motion.button
+                                  key={a.id}
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  transition={{ delay: 0.1 * assignmentsDueSoon.indexOf(a) }}
+                                  onClick={() => handleDailyBriefingSelect(a.id)}
+                                  className="w-full text-left bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-3xl p-6 flex items-center justify-between hover:border-blue-500/30 hover:bg-blue-500/5 transition-all group"
+                                >
+                                  <div className="flex items-center gap-4">
+                                    <div className="p-3 rounded-lg bg-blue-500/10 text-blue-500">
+                                      <SubjectIcon className="w-5 h-5" />
+                                    </div>
+                                    <div>
+                                      <p className="font-bold text-lg">{a.title}</p>
+                                      <div className="flex items-center gap-2 text-gray-400 text-xs font-bold uppercase tracking-widest mt-1">
+                                        <span>{a.subject}</span>
+                                        {gradeImpact && (
+                                          <>
+                                            <div className="w-1 h-1 rounded-full bg-gray-300 dark:bg-white/10" />
+                                            <span className="text-green-500">+{gradeImpact}% Impact</span>
+                                          </>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <Icons.ChevronRight className="w-5 h-5 text-gray-300 dark:text-white/20 group-hover:text-blue-500 transition-colors" />
+                                </motion.button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Due Tomorrow Section */}
+                      {dueTomorrow.length > 0 && (
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-2 h-2 rounded-full bg-blue-500" />
+                            <h3 className="text-sm font-bold uppercase tracking-widest text-blue-500">Due Tomorrow — {dueTomorrow.length}</h3>
+                          </div>
+                          <div className="space-y-3">
+                            {dueTomorrow.map((a, idx) => {
+                              const SubjectIcon = getSubjectIcon(a.subject);
+                              const gradeImpact = getGradeImpact(a);
+
+                              return (
+                                <motion.button
+                                  key={a.id}
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  transition={{ delay: 0.05 * (dueToday.length + idx) }}
+                                  onClick={() => handleDailyBriefingSelect(a.id)}
+                                  className="w-full text-left bg-white dark:bg-card/40 border border-gray-100 dark:border-white/10 rounded-2xl sm:rounded-3xl p-4 sm:p-6 flex items-center justify-between hover:border-blue-500/30 hover:bg-blue-500/5 transition-all group"
+                                >
+                                  <div className="flex items-center gap-3 sm:gap-4 flex-1 min-w-0">
+                                    <div className="p-2 sm:p-3 rounded-lg bg-blue-500/10 text-blue-500 shrink-0">
+                                      <SubjectIcon className="w-4 h-4 sm:w-5 sm:h-5" />
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <p className="font-bold text-base sm:text-lg truncate">{a.title}</p>
+                                      <div className="flex items-center gap-2 text-gray-400 text-xs font-bold uppercase tracking-widest mt-1">
+                                        <span className="truncate">{a.subject}</span>
+                                        {gradeImpact && (
+                                          <>
+                                            <div className="w-1 h-1 rounded-full bg-gray-300 dark:bg-white/10 shrink-0" />
+                                            <span className="text-green-500 shrink-0">+{gradeImpact}%</span>
+                                          </>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <Icons.ChevronRight className="w-5 h-5 text-gray-300 dark:text-white/20 group-hover:text-blue-500 transition-colors shrink-0 ml-2" />
+                                </motion.button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+              <button onClick={handleDailyBriefingDismiss} className="mt-8 sm:mt-12 px-6 py-3 text-gray-400 font-bold uppercase tracking-widest text-xs hover:text-white hover:bg-white/5 rounded-xl transition-all">Dismiss</button>
+            </motion.div>
+          ) : (
+            <motion.div key="chat" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full flex flex-col">
+              <div className="h-24 border-b border-gray-100 dark:border-white/5 flex items-center justify-between px-10 shrink-0"><div className="flex items-center gap-6"><div className="flex bg-gray-100 dark:bg-white/5 p-1 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm"><button onClick={() => { setStrategy('scholar'); playUISound('switch'); }} className={`px-5 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${strategy === 'scholar' ? 'bg-white dark:bg-white/10 text-blue-600 dark:text-blue-400 shadow-md' : 'text-gray-400'}`}>Scholar</button><button onClick={() => { setStrategy('cheat'); playUISound('switch'); }} className={`px-5 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${strategy === 'cheat' ? 'bg-white dark:bg-white/10 text-amber-500 shadow-md' : 'text-gray-400'}`}>Cheat</button></div><div className="flex bg-gray-100 dark:bg-white/5 p-1 rounded-2xl border border-gray-200 dark:border-white/10 shadow-sm"><button onClick={() => { setIntelligence('fast'); playUISound('switch'); }} className={`px-5 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${intelligence === 'fast' ? 'bg-white dark:bg-white/10 text-rose-500 shadow-md' : 'text-gray-400'}`}>Fast</button><button onClick={() => { setIntelligence('think'); playUISound('switch'); }} className={`px-5 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${intelligence === 'think' ? 'bg-white dark:bg-white/10 text-indigo-500 shadow-md' : 'text-gray-400'}`}>Think</button></div>{activeAssignment && <div className="flex items-center gap-3 px-4 py-2 bg-blue-500/5 border border-blue-500/10 rounded-xl"><Icons.FileText className="w-4 h-4 text-blue-500" /><span className="text-xs font-bold text-blue-500 truncate max-w-[150px] uppercase">{activeAssignment.title}</span><button onClick={onClearContext} className="text-blue-500 hover:text-blue-600"><Icons.X className="w-3 h-3" /></button></div>}</div><div className="flex items-center gap-2 opacity-30"><Icons.Sparkles className="w-3.5 h-3.5" /><span className="text-[9px] font-bold uppercase tracking-widest">Engine: Intel Matrix</span></div></div>
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div ref={scrollRef} className="flex-1 overflow-y-auto p-10 space-y-10">
+                  {messages.length === 0 && (<div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto opacity-30"><Icons.Brain className="w-16 h-16 mb-8" /><h3 className="text-3xl font-bold tracking-tighter mb-4">Pulse Intelligence</h3><p className="text-lg font-medium leading-relaxed">System active. <span className="uppercase text-blue-500">{protocol}</span> engaged via <span className="uppercase text-blue-500">{strategy}</span> + <span className="uppercase text-blue-500">{intelligence}</span>.</p></div>)}
+                  {messages.map((m, i) => {
+                    // Check if this message contains objectives
+                    const hasObjectives = m.role === 'model' && m.content.includes('OBJECTIVE');
+                    const parsedObjectives = hasObjectives ? parseObjectivesFromText(m.content, allAssignments) : [];
+
+                    return (
+                      <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+                        {/* User message or plain model message */}
+                        {(!hasObjectives || m.role === 'user') && (
+                          <div className={`max-w-[80%] rounded-[2.5rem] p-8 ${m.role === 'user' ? 'bg-blue-600 text-white shadow-xl shadow-blue-500/10' : 'bg-gray-100 dark:bg-white/5'}`}>
+                            {m.image && <img src={m.image} alt="Upload" className="max-w-xs rounded-2xl mb-6 border border-white/10" />}
+                            {m.file && (<div className="mb-4 flex items-center gap-3 bg-white/10 p-4 rounded-2xl border border-white/10 max-w-xs"><Icons.File className="w-6 h-6 text-white/60" /><span className="text-sm font-bold truncate text-white">{m.file.name}</span></div>)}
+                            <div className="text-lg font-medium leading-relaxed whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: m.role === 'model' ? processMath(m.content) : m.content }} />
+                            {m.role === 'model' && m.sources && m.sources.length > 0 && (<div className="mt-8 pt-6 border-t border-gray-100 dark:border-white/10 space-y-3"><p className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-500/60">Retrieved Intelligence</p><div className="flex flex-wrap gap-2">{m.sources.map((source, idx) => (<a key={idx} href={source.uri} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl hover:border-blue-500/40 hover:bg-blue-500/5 transition-all group max-w-[200px]"><Icons.Link className="w-3 h-3 text-gray-400 group-hover:text-blue-500" /><span className="text-[10px] font-bold text-gray-500 group-hover:text-blue-500 truncate">{source.title}</span></a>))}</div></div>)}
+                          </div>
+                        )}
+
+                        {/* Objective cards for model messages with objectives */}
+                        {hasObjectives && parsedObjectives.length > 0 && m.role === 'model' && (
+                          <div className="w-full space-y-4">
+                            <div className="flex items-center gap-3 mb-6">
+                              <Icons.Sparkles className="w-5 h-5 text-blue-500" />
+                              <h3 className="text-2xl font-bold tracking-tighter">Tactical Briefing</h3>
+                              <div className="flex-1 h-px bg-gradient-to-r from-gray-200 dark:from-white/10 to-transparent" />
+                            </div>
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                              {parsedObjectives.map((obj, idx) => (
+                                <ObjectiveCard key={idx} objective={obj} reduceMotion={reduceMotion} />
+                              ))}
+                            </div>
+                            {m.sources && m.sources.length > 0 && (<div className="mt-8 pt-6 border-t border-gray-100 dark:border-white/10 space-y-3"><p className="text-[10px] font-black uppercase tracking-[0.2em] text-blue-500/60">Retrieved Intelligence</p><div className="flex flex-wrap gap-2">{m.sources.map((source, idx) => (<a key={idx} href={source.uri} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl hover:border-blue-500/40 hover:bg-blue-500/5 transition-all group max-w-[200px]"><Icons.Link className="w-3 h-3 text-gray-400 group-hover:text-blue-500" /><span className="text-[10px] font-bold text-gray-500 group-hover:text-blue-500 truncate">{source.title}</span></a>))}</div></div>)}
+                          </div>
+                        )}
+
+
+                        {m.role === 'model' && (
+                          <div className="mt-4 flex items-center gap-3">
+                            <button onClick={() => handleCopy(m.content, i)} className="flex items-center gap-2 px-6 py-3 bg-white dark:bg-white/5 border border-gray-100 dark:border-white/10 rounded-2xl text-[10px] font-bold uppercase tracking-widest text-gray-400 hover:text-blue-500 transition-all min-w-[100px] justify-center">{copiedId === i ? <Icons.Check className="w-3.5 h-3.5 text-green-500" /> : <Icons.Clipboard className="w-3.5 h-3.5" />}<span>{copiedId === i ? 'Copied' : 'Copy'}</span></button>
+
+                            {/* Show Submit button if active assignment exists */}
+                            {activeAssignment && (
+                              <button
+                                onClick={() => {
+                                  onClearContext();
+                                  setActiveTab('assignments');
+                                  playUISound('action');
+                                }}
+                                className="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl text-[10px] font-bold uppercase tracking-widest transition-all min-w-[100px] justify-center"
+                              >
+                                <Icons.Upload className="w-3.5 h-3.5" />
+                                <span>Submit</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </motion.div>
+                    );
+                  })}
+                  {isLoading && <div className="flex justify-start"><div className="bg-gray-100 dark:bg-white/5 rounded-[2.5rem] px-10 py-8 flex gap-3"><div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" /><div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce [animation-delay:0.2s]" /><div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce [animation-delay:0.4s]" /></div></div>}
+                </div>
+                <div className="p-10 border-t border-gray-100 dark:border-white/5">
+                  <div className="max-w-5xl mx-auto space-y-4">
+                    {localError && (<motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-4 p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl text-rose-500 text-xs font-bold uppercase tracking-widest flex items-center gap-3"><Icons.Error className="w-4 h-4" /><span>{localError}</span></motion.div>)}
+
+                    {/* Word document upload preview */}
+                    {uploadedWordDoc && (
+                      <div className="mb-6 relative inline-block">
+                        <div className="h-20 px-6 flex items-center gap-3 bg-emerald-100 dark:bg-emerald-900/20 rounded-2xl border-2 border-emerald-500">
+                          <Icons.FileText className="w-6 h-6 text-emerald-500" />
+                          <div className="flex flex-col">
+                            <span className="text-xs font-bold text-emerald-600 dark:text-emerald-400 truncate max-w-[150px]">{uploadedWordDoc.name}</span>
+                            <span className="text-[10px] font-medium text-emerald-500/60">{formatFileSize(uploadedWordDoc.size)}</span>
+                          </div>
+                        </div>
+                        <button onClick={() => setUploadedWordDoc(null)} className="absolute -top-2 -right-2 bg-emerald-600 text-white rounded-full p-1"><Icons.X className="w-3 h-3" /></button>
+                      </div>
+                    )}
+
+                    {/* Word document uploading progress */}
+                    {uploadingWord && (
+                      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-4 p-4 bg-blue-500/10 border border-blue-500/20 rounded-2xl">
+                        <div className="flex items-center gap-3 mb-2">
+                          <Icons.Spinner className="w-4 h-4 text-blue-500" />
+                          <span className="text-xs font-bold text-blue-500">Uploading Word document...</span>
+                          <span className="text-xs font-bold text-blue-500 ml-auto">{uploadProgress}%</span>
+                        </div>
+                        <div className="w-full h-2 bg-gray-200 dark:bg-white/10 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-500 transition-all duration-300"
+                            style={{ width: `${uploadProgress}%` }}
+                          />
+                        </div>
+                      </motion.div>
+                    )}
+
+                    {(attachedImage || attachedFile) && (<div className="mb-6 relative inline-block">{attachedImage ? <img src={attachedImage} className="h-20 w-20 object-cover rounded-2xl border-2 border-blue-500" /> : <div className="h-20 px-6 flex items-center gap-3 bg-gray-100 dark:bg-white/5 rounded-2xl border-2 border-blue-500"><Icons.File className="w-6 h-6 text-blue-500" /><span className="text-xs font-bold text-blue-500 truncate max-w-[100px]">{attachedFile?.name}</span></div>}<button onClick={() => { setAttachedImage(null); setAttachedFile(null); }} className="absolute -top-2 -right-2 bg-blue-600 text-white rounded-full p-1"><Icons.X className="w-3 h-3" /></button></div>)}
+
+                    {/* Show interim transcript while recording */}
+                    {isRecording && interimTranscript && (
+                      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mb-4 p-4 bg-blue-500/10 border border-blue-500/20 rounded-2xl">
+                        <div className="flex items-center gap-3 mb-2">
+                          <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                          <span className="text-xs font-bold text-blue-500">Listening...</span>
+                        </div>
+                        <p className="text-sm text-gray-600 dark:text-gray-300 italic">{interimTranscript}</p>
+                      </motion.div>
+                    )}
+
+                    <div className="relative group">
+                      <input type="text" value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSend()} placeholder={`Query via ${strategy}... (or drop material here)`} className="w-full bg-gray-100 dark:bg-white/5 border border-transparent dark:border-white/10 rounded-[2.5rem] px-10 py-8 outline-none focus:border-blue-500/50 text-xl font-medium transition-all pr-52" />
+                      <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-3">
+                        <div className="relative">
+                          <button onClick={() => { setShowAttachMenu(!showAttachMenu); playUISound('switch'); }} className={`p-4 hover:bg-gray-200 dark:hover:bg-white/10 rounded-2xl transition-all text-gray-500 ${showAttachMenu ? 'bg-gray-200 dark:bg-white/15 text-blue-500' : ''}`}><Icons.Paperclip className="w-6 h-6" /></button>
+                          <AnimatePresence>{showAttachMenu && (<><div className="fixed inset-0 z-[140]" onClick={() => setShowAttachMenu(false)} /><motion.div initial={{ opacity: 0, scale: 0.9, y: 10 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 10 }} className="absolute bottom-20 right-0 w-56 bg-white dark:bg-[#1a1a1a] border border-gray-100 dark:border-white/10 rounded-[2rem] shadow-2xl p-3 z-[150]"><div className="flex flex-col gap-1"><button onClick={() => { fileRef.current?.click(); setShowAttachMenu(false); }} className="flex items-center gap-4 w-full p-4 rounded-xl hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.File className="w-5 h-5 text-blue-500 opacity-60 group-hover:opacity-100" /><span className="text-xs font-bold uppercase tracking-widest">📎 Attach Files</span></button><button onClick={handleOpenCamera} className="flex items-center gap-4 w-full p-4 rounded-xl hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.Camera className="w-5 h-5 text-purple-500 opacity-60 group-hover:opacity-100" /><span className="text-xs font-bold uppercase tracking-widest">📷 Take Photo</span></button><button onClick={() => { setShowPasteModal(true); setShowAttachMenu(false); }} className="flex items-center gap-4 w-full p-4 rounded-xl hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group text-left"><Icons.Clipboard className="w-5 h-5 text-green-500 opacity-60 group-hover:opacity-100" /><span className="text-xs font-bold uppercase tracking-widest">📋 Paste Text</span></button></div></motion.div></>)}</AnimatePresence>
+                        </div>
+                        <button
+                          onClick={toggleDictation}
+                          className={`p-4 rounded-2xl transition-all relative ${isRecording ? 'bg-red-500 text-white' : 'hover:bg-gray-200 dark:hover:bg-white/10 text-gray-500'}`}
+                          title={isRecording ? "Stop recording" : "Start voice input"}
+                        >
+                          {isRecording ? (
+                            <>
+                              <Icons.MicOff className="w-6 h-6" />
+                              <span className="absolute top-1 right-1 w-2 h-2 bg-white rounded-full animate-pulse" />
+                            </>
+                          ) : (
+                            <Icons.Mic className="w-6 h-6" />
+                          )}
+                        </button>
+                        <button onClick={handleSend} disabled={!input.trim() && !attachedImage && !attachedFile && !uploadedWordDoc} className="p-4 bg-blue-600 text-white rounded-2xl hover:bg-blue-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed"><Icons.Send className="w-6 h-6" /></button>
+                      </div>
+                      <input type="file" ref={fileRef} hidden accept="image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword" onChange={handleFileUpload} /><input type="file" ref={cameraRef} hidden accept="image/*" capture="environment" onChange={handleFileUpload} />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+      <PasteModal isOpen={showPasteModal} onClose={() => setShowPasteModal(false)} onAdd={handlePasteText} />
+
+      {/* Camera Modal */}
+      <AnimatePresence>
+        {showCameraModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+            onClick={() => { stopCamera(); setShowCameraModal(false); }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="relative max-w-2xl w-full bg-white dark:bg-[#1a1a1a] rounded-3xl overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-gray-100 dark:border-white/10">
+                <h3 className="text-2xl font-bold">Take Photo</h3>
+                <p className="text-sm text-gray-500 mt-1">Position yourself and click capture</p>
+              </div>
+
+              <div className="relative bg-black aspect-video">
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-cover"
+                />
+                <canvas ref={canvasRef} className="hidden" />
+              </div>
+
+              <div className="p-6 flex gap-4 justify-end">
+                <button
+                  onClick={() => { stopCamera(); setShowCameraModal(false); }}
+                  className="px-6 py-3 rounded-2xl bg-gray-100 dark:bg-white/5 hover:bg-gray-200 dark:hover:bg-white/10 font-bold transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={capturePhoto}
+                  className="px-8 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white font-bold transition-all flex items-center gap-2"
+                >
+                  <Icons.Camera className="w-5 h-5" />
+                  Capture
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+export default Dashboard;

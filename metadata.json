@@ -1,0 +1,7 @@
+{
+  "name": "Flash.",
+  "description": "A minimalist, high-performance AI interface accessed via exclusive beta entry.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
