@@ -1,3 +1,6 @@
+// Backend URL from environment variable (falls back to localhost for dev)
+const BACKEND_URL = (import.meta as any).env?.VITE_BACKEND_URL || 'http://localhost:3001';
+
 /**
  * Upload Word document (.doc or .docx) to Google Cloud Storage
  * @param file - The Word document file to upload
@@ -77,7 +80,7 @@ export async function uploadWordDocument(
         });
 
         // Send request
-        xhr.open('POST', 'http://localhost:3001/upload-word');
+        xhr.open('POST', `${BACKEND_URL}/upload-word`);
         xhr.send(formData);
     });
 }
