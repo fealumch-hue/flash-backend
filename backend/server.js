@@ -18,6 +18,15 @@ app.use(cors({
 
 app.use(express.json());
 
+// Health check endpoint - MUST BE FIRST
+app.get('/', (req, res) => {
+    res.json({
+        status: 'ok',
+        message: 'Flash Backend API Running',
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', message: 'Pulse AI Upload Server Running' });
@@ -31,11 +40,11 @@ if (process.env.GCS_BUCKET_NAME && process.env.GCS_BUCKET_NAME !== 'your-bucket-
     import('./routes/upload-gcs.js').then((module) => {
         app.use('/upload-word', module.default);
         console.log('✅ GCS Word upload route enabled');
-    }).catch((err) => {
-        console.warn('⚠️  GCS upload route disabled (not configured):', err.message);
+    }).catch(err => {
+        console.log('⚠️ GCS upload route not loaded:', err.message);
     });
 } else {
-    console.warn('⚠️  GCS Word upload route disabled (GCS_BUCKET_NAME not configured)');
+    console.log('⚠️ GCS not configured - Word upload disabled');
     // Provide a fallback endpoint that returns an error
     app.post('/upload-word', (req, res) => {
         res.status(503).json({
@@ -48,13 +57,14 @@ if (process.env.GCS_BUCKET_NAME && process.env.GCS_BUCKET_NAME !== 'your-bucket-
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Error:', err);
-    res.status(err.status || 500).json({
+    res.status(500).json({
         error: err.message || 'Internal server error',
         ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📦 Supabase Bucket: ${process.env.SUPABASE_BUCKET}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+    console.log(`📦 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🌐 CORS: Enabled for all origins`);
 });
