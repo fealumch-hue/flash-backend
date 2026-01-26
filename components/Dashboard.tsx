@@ -15,6 +15,9 @@ import { submitScore, subscribeToLeaderboard, getUserRank, LeaderboardEntry } fr
 import FileUpload from './FileUpload';
 import mammoth from 'mammoth';
 
+// School Bot URL from environment variable
+const SCHOOL_BOT_URL = (import.meta as any).env?.VITE_SCHOOL_BOT_URL || 'http://localhost:8002';
+
 declare global {
   interface Window {
     katex: any;
@@ -835,7 +838,7 @@ const HomeworkScraperModal: React.FC<{ isOpen: boolean; onClose: () => void; red
     if (!email || !password) return;
     setIsLoading(true); setError(null); playUISound('action');
     try {
-      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-schoolwork', {
+      const response = await fetch(`${SCHOOL_BOT_URL}/get-schoolwork`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
@@ -1192,7 +1195,7 @@ const GradesSection: React.FC<{ reduceMotion: boolean; activeAssignments: Assign
     try {
       setGradeProgress(10);
 
-      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-grades', {
+      const response = await fetch(`${SCHOOL_BOT_URL}/get-grades`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
@@ -2067,7 +2070,7 @@ const PortalSubmitModal: React.FC<{ isOpen: boolean; onClose: () => void; assign
     formData.append('password', password);
 
     try {
-      const response = await fetch('https://306e10a557c9.ngrok-free.app/auto-submit', {
+      const response = await fetch(`${SCHOOL_BOT_URL}/auto-submit`, {
         method: 'POST',
         body: formData,
       });
@@ -2301,7 +2304,7 @@ const BulkSubmitModal: React.FC<{
       formData.append('password', password);
 
       try {
-        const response = await fetch('https://306e10a557c9.ngrok-free.app/auto-submit', {
+        const response = await fetch(`${SCHOOL_BOT_URL}/auto-submit`, {
           method: 'POST',
           body: formData,
         });
@@ -2706,7 +2709,7 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
       // Start progress simulation
       setRefreshProgress(10);
 
-      const response = await fetch('https://306e10a557c9.ngrok-free.app/get-schoolwork', {
+      const response = await fetch(`${SCHOOL_BOT_URL}/get-schoolwork`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
