@@ -2659,7 +2659,13 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
 
     return {
       overdueAssignments: overdue.sort((a, b) => new Date(a.dueDate!).getTime() - new Date(b.dueDate!).getTime()),
-      upcomingAssignments: upcoming,
+      upcomingAssignments: upcoming.sort((a, b) => {
+        // Sort by due date - assignments without dates go to the end
+        if (!a.dueDate && !b.dueDate) return 0;
+        if (!a.dueDate) return 1;
+        if (!b.dueDate) return -1;
+        return new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime();
+      }),
       historyAssignments: history.sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0)),
       hasActiveAssignments: overdue.length > 0 || upcoming.length > 0
     };
@@ -2731,7 +2737,13 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
 
       setRefreshProgress(95);
       if (parsedAssignments.length > 0) {
-        addAssignments(parsedAssignments.map(a => ({ ...a, subject: normalizeSubject(a.subject) })));
+        // Delete all non-overdue assignments, but keep overdue ones
+        setAssignments(prev => {
+          const overdueToKeep = prev.filter(a => !a.isCompleted && a.dueDate && isDateInPast(a.dueDate));
+          const completed = prev.filter(a => a.isCompleted);
+          const newAssignments = parsedAssignments.map(a => ({ ...a, subject: normalizeSubject(a.subject) }));
+          return [...overdueToKeep, ...completed, ...newAssignments];
+        });
         setRefreshProgress(100);
         playUISound('success');
         // Set timestamp for Pulse to detect and show visual briefing
@@ -2825,6 +2837,10 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
                       <button onClick={handleRefreshAssignments} disabled={isRefreshing} className="px-10 py-6 border border-gray-200 dark:border-white/10 hover:border-blue-500/50 text-gray-500 dark:text-gray-400 hover:text-blue-500 rounded-[2.5rem] font-bold uppercase tracking-widest transition-all text-xs flex items-center justify-center gap-3 disabled:opacity-50">
                         {isRefreshing ? <Icons.Spinner className="w-4 h-4" /> : <Icons.Restore className="w-4 h-4" />}
                         <span>{isRefreshing ? 'Refreshing...' : 'Tactical Refresh'}</span>
+                      </button>
+                      <button onClick={() => { setIsClearBoardModalOpen(true); playUISound('action'); }} className="px-10 py-6 border border-rose-200 dark:border-rose-500/20 hover:border-rose-500/50 text-rose-500 dark:text-rose-400 hover:text-rose-600 dark:hover:text-rose-300 rounded-[2.5rem] font-bold uppercase tracking-widest transition-all text-xs flex items-center justify-center gap-3">
+                        <Icons.Trash className="w-4 h-4" />
+                        <span>Clear Board</span>
                       </button>
                       <button id="tour-new-objective" onClick={() => { setIsModalOpen(true); playUISound('action'); }} className="bg-gray-900 dark:bg-white text-white dark:text-black px-12 py-6 rounded-[2.5rem] font-bold uppercase tracking-widest shadow-2xl hover:opacity-90 active:scale-95 transition-all">New Objective</button>
                     </div>
