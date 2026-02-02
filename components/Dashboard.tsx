@@ -1859,17 +1859,37 @@ const AssignmentCard: React.FC<{ assignment: Assignment; settings: AppSettings; 
         <div className="pt-10 space-y-4">
           {!isHistory && settings.suggestPulseDueToday && urgency?.type === 'today' && <button onClick={(e) => { e.stopPropagation(); onSelect?.(); }} className="w-full py-3 bg-blue-500/5 hover:bg-blue-500/10 text-blue-500 border border-blue-500/20 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2"><Icons.Sparkles className="w-3 h-3" /><span>Need help? Ask Pulse</span></button>}
           {!isHistory && assignment.has_attachment && assignment.attachmentUrl && (
-            <button 
-              onClick={(e) => { 
-                e.stopPropagation(); 
-                window.open(assignment.attachmentUrl, '_blank'); 
-                playUISound('action');
-              }} 
-              className="w-full py-4 bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 border border-blue-500/30 rounded-2xl text-xs font-bold uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3"
-            >
-              <Icons.FileText className="w-4 h-4" />
-              <span>Open File</span>
-            </button>
+            <div className="flex gap-3">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Create a temporary anchor to trigger download
+                  const link = document.createElement('a');
+                  link.href = assignment.attachmentUrl;
+                  link.download = assignment.title || 'assignment';
+                  link.target = '_blank';
+                  document.body.appendChild(link);
+                  link.click();
+                  document.body.removeChild(link);
+                  playUISound('action');
+                }}
+                className="flex-1 py-4 bg-green-500/10 hover:bg-green-500/20 text-green-500 border border-green-500/30 rounded-2xl text-xs font-bold uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3"
+              >
+                <Icons.Download className="w-4 h-4" />
+                <span>Download</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(assignment.attachmentUrl, '_blank');
+                  playUISound('action');
+                }}
+                className="flex-1 py-4 bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 border border-blue-500/30 rounded-2xl text-xs font-bold uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3"
+              >
+                <Icons.FileText className="w-4 h-4" />
+                <span>Open File</span>
+              </button>
+            </div>
           )}
           {!isHistory ? (
             <div className="flex gap-4">
@@ -2443,11 +2463,11 @@ const TacticalRefreshModal: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
 
   return createPortal(
     <div className="fixed inset-0 z-[2000] flex items-center justify-center p-6">
-      <motion.div 
-        initial={{ opacity: 0 }} 
-        animate={{ opacity: 1 }} 
-        exit={{ opacity: 0 }} 
-        className="absolute inset-0 bg-black/95 backdrop-blur-3xl" 
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="absolute inset-0 bg-black/95 backdrop-blur-3xl"
       />
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
@@ -2757,10 +2777,14 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
       return;
     }
 
+    // Show modal BEFORE starting the API call
     setIsRefreshing(true);
     setRefreshProgress(0);
     setRefreshError(null);
     playUISound('action');
+
+    // Small delay to ensure modal renders before blocking API call
+    await new Promise(resolve => setTimeout(resolve, 100));
 
     try {
       // Start progress simulation

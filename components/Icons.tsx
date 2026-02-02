@@ -11,7 +11,7 @@ import {
   Pencil, Palette, Globe, Monitor, Dumbbell, Languages, Library, Sigma,
   Calculator, Percent, UploadCloud, List, Flame, Clock3, BarChart3,
   TrendingUp, TrendingDown, Award, Menu, Lightbulb, Mic, MicOff, Target,
-  AlertTriangle, Check
+  AlertTriangle, Check, Download as DownloadIcon
 } from 'lucide-react';
 
 export const Icons = {
@@ -80,4 +80,5 @@ export const Icons = {
   Mic: ({ className }: { className?: string }) => <Mic className={className} />,
   MicOff: ({ className }: { className?: string }) => <MicOff className={className} />,
   Target: ({ className }: { className?: string }) => <Target className={className} />,
+  Download: ({ className }: { className?: string }) => <DownloadIcon className={className} />,
 };
