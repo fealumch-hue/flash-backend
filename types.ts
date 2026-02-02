@@ -22,6 +22,8 @@ export interface Assignment {
   isCompleted?: boolean;
   attachments?: string[]; // Legacy support for plain names
   richAttachments?: Attachment[]; // New detailed support
+  has_attachment?: boolean; // Backend indicates if assignment has a file
+  attachmentUrl?: string; // Public URL to the mirrored file in Google Cloud Storage
 }
 
 export interface UserProfile {

@@ -16,7 +16,7 @@ import FileUpload from './FileUpload';
 import mammoth from 'mammoth';
 
 // School Bot URL from environment variable (ensure no trailing slash)
-const SCHOOL_BOT_URL = ((import.meta as any).env?.VITE_SCHOOL_BOT_URL || 'https://school-bot-automation-production.up.railway.app').replace(/\/$/, '');
+const SCHOOL_BOT_URL = ((import.meta as any).env?.VITE_SCHOOL_BOT_URL || 'http://localhost:8002').replace(/\/$/, '');
 
 declare global {
   interface Window {
@@ -1858,19 +1858,6 @@ const AssignmentCard: React.FC<{ assignment: Assignment; settings: AppSettings; 
           <div className="space-y-4"><div className="flex flex-col gap-4">{urgency && <div className="flex items-center gap-2 h-6"><div className={`w-2.5 h-2.5 rounded-full shrink-0 ${urgency.color} ${urgency.glow} animate-pulse`} /><AnimatePresence>{isHovered && <motion.span initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} className={`text-[10px] font-black uppercase tracking-[0.25em] ${urgency.color.replace('bg-', 'text-')}`}>{urgency.label}</motion.span>}</AnimatePresence></div>}<h3 className={`text-[2rem] font-bold tracking-tighter leading-[1.1] line-clamp-3 ${isHistory ? 'line-through opacity-50' : ''}`}>{assignment.title}</h3></div>{assignment.dueDate && <div className="flex items-center gap-2 text-gray-400 text-sm font-bold opacity-60"><Icons.Calendar className="w-4 h-4" /><span className="tracking-wide">{getRelativeDueDate(assignment.dueDate)}</span></div>}</div>{settings.showChecklist && !isHistory && <div className="pt-6 space-y-3 border-t border-gray-100 dark:border-white/5"><p className="text-[9px] font-bold uppercase tracking-widest text-gray-400 mb-2">Submission Checklist</p>{['AI Accuracy Reviewed', 'Formatting Applied', 'Citations Verified'].map(item => <div key={item} className="flex items-center gap-3"><div className="w-4 h-4 rounded-md border border-gray-200 dark:border-white/10 flex items-center justify-center"><Icons.Check className="w-2.5 h-2.5 text-blue-500 opacity-20" /></div><span className="text-xs font-medium text-gray-500">{item}</span></div>)}</div>}</div>
         <div className="pt-10 space-y-4">
           {!isHistory && settings.suggestPulseDueToday && urgency?.type === 'today' && <button onClick={(e) => { e.stopPropagation(); onSelect?.(); }} className="w-full py-3 bg-blue-500/5 hover:bg-blue-500/10 text-blue-500 border border-blue-500/20 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2"><Icons.Sparkles className="w-3 h-3" /><span>Need help? Ask Pulse</span></button>}
-          {!isHistory && assignment.has_attachment && assignment.attachmentUrl && (
-            <button 
-              onClick={(e) => { 
-                e.stopPropagation(); 
-                window.open(assignment.attachmentUrl, '_blank'); 
-                playUISound('action');
-              }} 
-              className="w-full py-4 bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 border border-blue-500/30 rounded-2xl text-xs font-bold uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3"
-            >
-              <Icons.FileText className="w-4 h-4" />
-              <span>Open File</span>
-            </button>
-          )}
           {!isHistory ? (
             <div className="flex gap-4">
               <button onClick={handlePortalAction} className="flex-1 py-6 bg-gray-900 dark:bg-white text-white dark:text-black rounded-[2rem] text-xs font-black uppercase tracking-[0.25em] hover:opacity-90 active:scale-[0.98] transition-all shadow-xl dark:shadow-white/5 flex items-center justify-center gap-3"><Icons.Link className="w-4 h-4" /><span>{isRedirecting ? 'Redirecting...' : 'Submit Portal'}</span></button>
@@ -2437,44 +2424,6 @@ const BulkSubmitModal: React.FC<{
   );
 };
 
-
-const TacticalRefreshModal: React.FC<{ isOpen: boolean }> = ({ isOpen }) => {
-  if (!isOpen) return null;
-
-  return createPortal(
-    <div className="fixed inset-0 z-[2000] flex items-center justify-center p-6">
-      <motion.div 
-        initial={{ opacity: 0 }} 
-        animate={{ opacity: 1 }} 
-        exit={{ opacity: 0 }} 
-        className="absolute inset-0 bg-black/95 backdrop-blur-3xl" 
-      />
-      <motion.div
-        initial={{ opacity: 0, scale: 0.95 }}
-        animate={{ opacity: 1, scale: 1 }}
-        exit={{ opacity: 0, scale: 0.95 }}
-        className="relative w-full max-w-2xl bg-white dark:bg-[#0d0d0d] rounded-[4rem] p-16 text-center border border-white/10 shadow-2xl"
-      >
-        <div className="flex flex-col items-center gap-8">
-          <Icons.Spinner className="w-16 h-16 text-blue-500 animate-spin" />
-          <div className="space-y-4">
-            <h2 className="text-4xl font-bold tracking-tighter text-gray-900 dark:text-white">Tactical Refresh in Progress</h2>
-            <p className="text-gray-500 dark:text-gray-400 font-medium text-lg max-w-lg mx-auto leading-relaxed">
-              Flash is scanning your assignments and mirroring any files to your cloud. This may take up to a minute depending on how many assignments have attachments.
-            </p>
-          </div>
-          <div className="flex items-center gap-3 px-6 py-3 bg-blue-500/10 rounded-full">
-            <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-            <span className="text-xs font-bold uppercase tracking-widest text-blue-500">Processing...</span>
-          </div>
-        </div>
-      </motion.div>
-    </div>,
-    document.body
-  );
-};
-
-
 const InSessionModal: React.FC<{
   isOpen: boolean;
   onClose: () => void;
@@ -2987,7 +2936,6 @@ const Dashboard: React.FC<{ onSignOut?: () => void }> = ({ onSignOut }) => {
           <ConfirmModal isOpen={!!pendingDeleteId} onClose={() => setPendingDeleteId(null)} onConfirm={() => pendingDeleteId && removeAssignment(pendingDeleteId)} title="Scrub Entry?" description="Objective will be removed from system board." confirmLabel="Scrub" variant="danger" reduceMotion={settings.reduceMotion} />
           {isPortalSubmitOpen && <PortalSubmitModal isOpen={isPortalSubmitOpen} onClose={() => setIsPortalSubmitOpen(false)} assignment={submittingAssignment} reduceMotion={settings.reduceMotion} onNavigateToSettings={() => setActiveTab('settings')} onSuccessfulSubmit={handleSuccessfulPortalSubmit} />}
           {isBulkSubmitOpen && <BulkSubmitModal isOpen={isBulkSubmitOpen} onClose={() => setIsBulkSubmitOpen(false)} assignments={assignments.filter(a => !a.isCompleted)} onSuccessfulSubmit={handleSuccessfulPortalSubmit} />}
-          <TacticalRefreshModal isOpen={isRefreshing} />
           <InSessionModal
             isOpen={showInSessionModal}
             onClose={() => {
